@@ -1,5 +1,5 @@
 import './style.css';
-import { api, ApiError, GameInvite, GameView, Me, ServerMsg, Socket } from './api';
+import { api, ApiError, BASE, GameInvite, GameView, Me, ServerMsg, Socket } from './api';
 import { Board } from './board';
 import { h, toast } from './dom';
 
@@ -24,19 +24,22 @@ let board: Board | null = null;
 let boardGameId: number | null = null;
 let lockTimer: number | undefined;
 
+/** The current app path, such as "/game", without the prefix the app is served under. */
+const appPath = () => location.pathname.slice(BASE.length) || '/';
+
 function navigate(path: string) {
-  if (location.pathname + location.search !== path) history.pushState(null, '', path);
+  if (location.pathname + location.search !== BASE + path) history.pushState(null, '', BASE + path);
   render();
 }
 window.addEventListener('popstate', () => render());
 
 function link(path: string, label: string) {
-  return h('a', { href: path, onclick: (e: Event) => (e.preventDefault(), navigate(path)) }, label);
+  return h('a', { href: BASE + path, onclick: (e: Event) => (e.preventDefault(), navigate(path)) }, label);
 }
 
 async function boot() {
   // A confirmation link logs in as its account, replacing any current session.
-  if (location.pathname !== '/verify') {
+  if (appPath() !== '/verify') {
     try {
       state.me = await api<Me>('GET', '/api/me');
     } catch (e) {
@@ -134,7 +137,7 @@ function send(msg: Parameters<Socket['send']>[0]) {
 }
 
 function route(): 'login' | 'register' | 'forgot' | 'reset' | 'verify' | 'profile' | 'game' | 'lobby' {
-  const p = location.pathname;
+  const p = appPath();
   if (p === '/register' || p === '/forgot' || p === '/reset' || p === '/verify') return p.slice(1) as 'register';
   if (!state.me) return 'login';
   if (p === '/profile') return 'profile';
@@ -174,7 +177,7 @@ function header() {
   return h(
     'header',
     {},
-    h('a', { class: 'logo', href: '/', onclick: (e: Event) => (e.preventDefault(), navigate(state.game ? '/game' : '/')) }, 'SET'),
+    h('a', { class: 'logo', href: BASE + '/', onclick: (e: Event) => (e.preventDefault(), navigate(state.game ? '/game' : '/')) }, 'SET'),
     h('span', { id: 'conn', class: state.connected ? 'on' : 'off' }, state.connected ? 'online' : 'connecting…'),
     h('nav', {}, state.game ? link('/game', 'Current game') : null, link('/', 'Lobby'), link('/profile', state.me!.username)),
   );

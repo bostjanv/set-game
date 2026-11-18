@@ -54,8 +54,14 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The path prefix the app is served under, such as "/set-game" behind a reverse proxy, or "" at the root.
+ * The script is served from `<prefix>/assets/` (or `/src/` in development), so drop its last two segments.
+ */
+export const BASE = new URL(import.meta.url).pathname.replace(/\/[^/]*\/[^/]*$/, '');
+
 export async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(BASE + path, {
     method,
     headers: body === undefined ? {} : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -76,7 +82,7 @@ export class Socket {
   }
 
   private open() {
-    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+    const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${BASE}/ws`;
     const ws = new WebSocket(url);
     this.ws = ws;
     ws.onopen = () => this.onStatus(true);

@@ -51,6 +51,20 @@ For frontend work, run `npm run dev` in `web/` as well: Vite serves on :5173 and
 | `SET_SMTP_URL` | unset | SMTP server, such as `smtps://user:password@smtp.example.com` (port 465) or `smtp://user:password@smtp.example.com:587?tls=required`. When unset, emails are written to the server log |
 | `SET_MAIL_FROM` | unset | Sender, such as `SET <set@example.com>`; required with `SET_SMTP_URL` |
 
+### Behind a reverse proxy under a path prefix
+
+The frontend works out its path prefix from where its script was loaded, so the same build runs at `/` or under a prefix such as `/set-game`. Have the proxy strip the prefix and forward WebSocket upgrades, and include the prefix in `SET_BASE_URL` (`https://your.site/set-game`) so emailed links open under it. With nginx:
+
+```nginx
+location /set-game/ {
+    proxy_pass http://127.0.0.1:8080/;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+}
+```
+
 ## Tests
 
 ```sh
