@@ -248,8 +248,7 @@ export class Board {
     if (!this.ready) return;
     const n = this.table.length;
     if (n === 0) return;
-    const bw = this.app.renderer.width / this.app.renderer.resolution;
-    const bh = this.app.renderer.height / this.app.renderer.resolution;
+    const { width: bw, height: bh } = this.app.screen;
     let best = { cols: 1, rows: n, w: 0 };
     for (let cols = 1; cols <= n; cols++) {
       const rows = Math.ceil(n / cols);
