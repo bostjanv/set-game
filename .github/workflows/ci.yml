@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 jobs:
@@ -35,8 +36,63 @@ jobs:
       # Type-checks with tsc, then bundles with Vite.
       - run: npm run build
 
+  archive:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history and tags, so git describe names the archive by its tag.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: ${{ matrix.arch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.24.1
+      - run: scripts/package.sh ${{ matrix.arch }}
+      # Uploads the .tar.gz itself rather than a zip around it; the artifact takes the file's name.
+      - uses: actions/upload-artifact@v7
+        with:
+          path: dist/set-game-*-linux-${{ matrix.arch }}.tar.gz
+          archive: false
+          if-no-files-found: error
+
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t set-game .
+
+  # On a pushed v* tag, once every other job passes, publishes a GitHub release with both archives.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [server, web, archive, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: set-game-*.tar.gz
+          path: dist
+          merge-multiple: true
+      - run: |
+          shopt -s globstar nullglob
+          files=(dist/**/*.tar.gz)
+          if [ ${#files[@]} -ne 2 ]; then echo "expected 2 archives, found: ${files[*]}" >&2; exit 1; fi
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes "${files[@]}"
+        env:
+          GH_TOKEN: ${{ github.token }}
