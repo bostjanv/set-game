@@ -309,7 +309,7 @@ async fn full_game() {
     let game = a.until_game(|g| g["last_claim"]["seq"] == 1).await;
     assert_eq!(score(&game, alice.id) + score(&game, bob.id), 1);
 
-    // A wrong claim locks bob out for 3 seconds, even for a valid set.
+    // A wrong claim locks bob out for 10 seconds, even for a valid set.
     b.until_game(|g| g["last_claim"]["seq"] == 1).await;
     let t = table(&b.game);
     let wrong = (2..t.len()).find(|&k| !set_server::rules::is_set(t[0], t[1], t[k])).unwrap();

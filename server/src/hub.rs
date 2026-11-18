@@ -16,7 +16,7 @@ pub type UserId = i64;
 pub type GameId = u64;
 
 pub const MAX_PLAYERS: usize = 8;
-pub const LOCKOUT: Duration = Duration::from_secs(3);
+pub const LOCKOUT: Duration = Duration::from_secs(10);
 /// A waiting game whose leader has been offline this long is cancelled.
 const LEADER_GRACE: Duration = Duration::from_secs(60);
 /// A running game with no connected player for this long is abandoned and not recorded.

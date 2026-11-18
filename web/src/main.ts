@@ -114,7 +114,7 @@ function onMessage(msg: ServerMsg) {
     }
     case 'claim_result':
       if (msg.result === 'ok') toast('Set!', 'success');
-      if (msg.result === 'not_a_set') toast('Not a set: 3 second lockout', 'error');
+      if (msg.result === 'not_a_set') toast('Not a set: 10 second lockout', 'error');
       if (msg.result === 'stale') toast('Too slow, those cards are gone');
       if (msg.result === 'locked') toast('You are locked out for a moment', 'error');
       board?.clearSelection(msg.result === 'not_a_set');
@@ -485,6 +485,13 @@ function waitingRoom(game: GameView) {
   ];
 }
 
+/** The server sends no update when a lockout ends, so the tag removes itself. */
+function lockedTag(ms: number) {
+  const tag = h('span', { class: 'tag locked' }, 'locked');
+  setTimeout(() => tag.remove(), ms);
+  return tag;
+}
+
 function scoreList(game: GameView) {
   const players = [...game.players].sort((a, b) => b.score - a.score);
   return h(
@@ -496,7 +503,7 @@ function scoreList(game: GameView) {
         { class: [p.id === state.me!.id ? 'me' : '', p.left || !p.connected ? 'away' : ''].join(' ') },
         h('span', { class: 'swatch', style: `background:${hex(playerColor(game, p.id))}` }),
         h('span', { class: 'name' }, p.username, p.left ? ' (left)' : !p.connected ? ' (offline)' : ''),
-        p.locked_ms > 0 ? h('span', { class: 'tag locked' }, 'locked') : null,
+        p.locked_ms > 0 ? lockedTag(p.locked_ms) : null,
         h('b', {}, p.score),
       ),
     ),
@@ -508,8 +515,6 @@ function sidebar(game: GameView) {
     h('h2', {}, 'Scores'),
     scoreList(game),
     h('p', { class: 'deck' }, `Cards left in deck: ${game.deck_remaining}`),
-    h('p', { id: 'lock', class: 'lock' }),
-    h('p', { class: 'hint' }, 'Click three cards that form a set.'),
     h('button', { class: 'secondary', onclick: () => confirm('Leave this game? Your score is kept.') && send({ type: 'leave_game' }) }, 'Leave game'),
   ];
 }
@@ -552,8 +557,6 @@ function updatePlaying(game: GameView) {
   const tick = () => {
     const left = until - performance.now();
     board?.setLocked(left > 0);
-    const el = document.getElementById('lock');
-    if (el) el.textContent = left > 0 ? `Locked out: ${(left / 1000).toFixed(1)} s` : '';
     if (left <= 0) clearInterval(lockTimer);
   };
   tick();

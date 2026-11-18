@@ -8,6 +8,7 @@ const PAD = 16;
 const CARD_COLORS = [0xd62e4d, 0x1d9a4c, 0x6a3fb5];
 const SELECT_COLOR = 0xf5b301;
 const ERROR_COLOR = 0xe11d48;
+const BORDER_COLOR = 0xd5d8e0;
 
 /** Card numbers encode their attributes in base 3, as on the server. */
 export function attrs(card: number) {
@@ -40,7 +41,7 @@ function buildCard(card: number): Container {
   const { count, shape, color, shading } = attrs(card);
   const fill = CARD_COLORS[color];
   const c = new Container();
-  c.addChild(new Graphics().roundRect(0, 0, W, H, 12).fill(0xffffff).stroke({ width: 2, color: 0xd5d8e0 }));
+  c.addChild(new Graphics().roundRect(0, 0, W, H, 12).fill(0xffffff));
   const sw = 82, sh = 34, gap = 14;
   const total = count * sh + (count - 1) * gap;
   for (let i = 0; i < count; i++) {
@@ -69,6 +70,7 @@ interface Slot {
   card: number;
   root: Container;
   frame: Graphics;
+  border: Graphics;
 }
 
 interface Anim {
@@ -195,9 +197,11 @@ export class Board {
     sprite.cursor = 'pointer';
     sprite.on('pointertap', () => this.toggle(card));
     const frame = new Graphics();
-    root.addChild(frame, sprite);
+    const border = new Graphics();
+    border.eventMode = 'none';
+    root.addChild(frame, sprite, border);
     this.app.stage.addChild(root);
-    return { card, root, frame };
+    return { card, root, frame, border };
   }
 
   private toggle(card: number) {
@@ -217,8 +221,9 @@ export class Board {
 
   private redrawFrames() {
     for (const slot of this.slots.values()) {
-      if (this.selected.has(slot.card)) this.drawFrame(slot, SELECT_COLOR, 6);
-      else slot.frame.clear();
+      slot.frame.clear();
+      const color = this.selected.has(slot.card) ? SELECT_COLOR : BORDER_COLOR;
+      slot.border.clear().roundRect(-W / 2, -H / 2, W, H, 12).stroke({ width: 2, color });
     }
   }
 

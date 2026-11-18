@@ -87,7 +87,6 @@ ul.scores .name { flex: 1; }
 ul.scores b { font-size: 1.2rem; }
 .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
 .deck { margin: 8px 0 0; color: var(--muted); }
-.lock { color: #be123c; font-weight: 600; margin: 0; min-height: 1.2em; }
 .side button { margin-top: auto; }
 .results { max-width: 420px; width: 100%; margin: 24px auto; display: flex; flex-direction: column; gap: 14px; text-align: center; }
 .results ul.scores { text-align: left; }

@@ -6,7 +6,7 @@ A multiplayer [SET](https://en.wikipedia.org/wiki/Set_(card_game)) card game. Th
 
 - **Accounts.** Anyone can register with an email address, a username, and a password. The server emails a confirmation link (valid 24 hours); the account can log in once the link is followed. Players log in with their email. A forgotten password is reset with an emailed link (valid 1 hour), which also logs out every other session. Each address gets at most one email per minute and five per hour.
 - **Games.** A player creates a game and becomes its leader, then invites registered players, who accept or decline in the lobby. Only the leader can start, and nobody can join after the start. A leader can also start alone; solo games are practice and are not counted in the statistics.
-- **Play.** Everyone sees the same table and clicks three cards. The first valid set to reach the server scores 1 point. A wrong set locks that player out for 3 seconds. When no set is on the table, the server deals 3 more cards. The game ends when the deck is empty and no set remains; the highest score wins and ties count as a win for each tied player.
+- **Play.** Everyone sees the same table and clicks three cards. The first valid set to reach the server scores 1 point. A wrong set locks that player out for 10 seconds. When no set is on the table, the server deals 3 more cards. The game ends when the deck is empty and no set remains; the highest score wins and ties count as a win for each tied player.
 - **Disconnects.** The game continues. Reconnecting puts you back into your game with your score.
 - **History.** Games played and wins per player, plus a leaderboard.
 
