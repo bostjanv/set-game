@@ -127,7 +127,9 @@ export class Board {
     for (const t of this.textures.values()) t.destroy(true);
   }
 
+  /** Ignored until `init` resolves: card textures need the renderer, and the caller sets the table once it is ready. */
   setTable(table: number[], claim: ClaimFlash | null) {
+    if (!this.ready) return;
     const first = this.lastSeq === null;
     const seq = claim?.seq ?? 0;
     const flash = !first && claim && seq !== this.lastSeq ? claim : null;
