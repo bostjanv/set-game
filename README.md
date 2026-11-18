@@ -19,6 +19,18 @@ docker run -p 8080:8080 -v set-data:/data set-game
 
 Open http://localhost:8080 and register. Without SMTP settings the confirmation link appears in the container log. To send real email, pass `-e SET_SMTP_URL=… -e SET_MAIL_FROM=… -e SET_BASE_URL=https://your.site`.
 
+## Release archives
+
+`scripts/package.sh` builds `dist/set-game-<version>-linux-x86_64.tar.gz` and `…-linux-aarch64.tar.gz` (pass `x86_64` or `aarch64` to build one). Each holds a statically linked `set-server` and the built frontend, so it runs on any Linux distribution. It needs npm, rustup, [zig](https://ziglang.org/download/), and `cargo install --locked cargo-zigbuild`.
+
+On the target machine:
+
+```sh
+tar -xzf set-game-<version>-linux-<arch>.tar.gz
+cd set-game-<version>-linux-<arch>
+./set-server   # serves web/dist and keeps set.db in this directory
+```
+
 ## Develop
 
 From the repository root:
