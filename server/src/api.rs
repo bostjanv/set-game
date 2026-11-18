@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::SqlitePool;
 
 use crate::auth::{self, CurrentUser};
 use crate::db::{self, now};
@@ -36,21 +37,55 @@ type ApiResult<T> = Result<T, ApiError>;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/register", post(register))
+        .route("/api/verify", post(verify))
         .route("/api/login", post(login))
+        .route("/api/forgot", post(forgot))
+        .route("/api/reset", post(reset))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
-        .route("/api/invites", get(list_invites).post(create_invite))
         .route("/api/players", get(players))
         .route("/api/leaderboard", get(leaderboard))
         .route("/ws", get(ws::handler))
 }
 
+const VERIFY_TTL: i64 = 24 * 3600;
+const RESET_TTL: i64 = 3600;
+
 #[derive(Deserialize)]
-struct Credentials {
+struct Registration {
+    email: String,
     username: String,
     password: String,
+}
+
+#[derive(Deserialize)]
+struct Login {
+    email: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct EmailOnly {
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct TokenBody {
+    token: String,
+    /// The new password, for `reset`.
     #[serde(default)]
-    code: String,
+    password: String,
+}
+
+fn check_password(password: &str) -> ApiResult<()> {
+    if password.chars().count() < 6 {
+        return Err(bad_request("Password must have at least 6 characters"));
+    }
+    Ok(())
+}
+
+async fn hash(password: String) -> String {
+    tokio::task::spawn_blocking(move || auth::hash_password(&password)).await.unwrap()
 }
 
 async fn start_session(state: &AppState, user_id: i64, username: String) -> ApiResult<impl IntoResponse> {
@@ -67,66 +102,194 @@ async fn start_session(state: &AppState, user_id: i64, username: String) -> ApiR
     ))
 }
 
-async fn register(State(state): State<AppState>, Json(body): Json<Credentials>) -> ApiResult<impl IntoResponse> {
+/// Stores a new single-use token for the user and returns it.
+async fn create_token(db: &SqlitePool, user_id: i64, purpose: &str, ttl: i64) -> ApiResult<String> {
+    let token = db::random_token();
+    sqlx::query("INSERT INTO email_tokens (token, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)")
+        .bind(&token)
+        .bind(user_id)
+        .bind(purpose)
+        .bind(now() + ttl)
+        .execute(db)
+        .await?;
+    Ok(token)
+}
+
+/// Deletes the token and returns its user, or fails when it is unknown, used, or expired.
+async fn take_token(db: &SqlitePool, token: &str, purpose: &str) -> ApiResult<i64> {
+    sqlx::query_scalar("DELETE FROM email_tokens WHERE token = ? AND purpose = ? AND expires_at > ? RETURNING user_id")
+        .bind(token)
+        .bind(purpose)
+        .bind(now())
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| bad_request("This link is invalid or has expired"))
+}
+
+/// Records a request to email `email`, or fails with 429 when the address already had one in
+/// the last minute or five in the last hour. Callers record requests for unknown addresses
+/// too, so the limit does not reveal which emails are registered.
+async fn rate_limit_email(conn: &mut sqlx::SqliteConnection, email: &str) -> ApiResult<()> {
+    let now = now();
+    sqlx::query("DELETE FROM email_sends WHERE sent_at <= ?").bind(now - 3600).execute(&mut *conn).await?;
+    // One statement, so concurrent requests cannot both pass the check.
+    let recorded = sqlx::query(
+        "INSERT INTO email_sends (email, sent_at) SELECT ?1, ?2
+         WHERE NOT EXISTS (SELECT 1 FROM email_sends WHERE email = ?1 AND sent_at > ?2 - 60)
+           AND (SELECT COUNT(*) FROM email_sends WHERE email = ?1) < 5",
+    )
+    .bind(email)
+    .bind(now)
+    .execute(conn)
+    .await?
+    .rows_affected();
+    if recorded == 0 {
+        return Err(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "We sent an email to this address recently. Wait a few minutes and try again.".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn send_mail(state: &AppState, to: &str, subject: &str, body: String) -> ApiResult<()> {
+    state.mailer.send(to, subject, body).await.map_err(|e| {
+        tracing::error!("sending email to {to}: {e}");
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Could not send the email. Try again later.".into())
+    })
+}
+
+/// Creates an unverified account and emails its confirmation link; the account can log in
+/// after following the link. Registering an email that is not confirmed yet replaces that account.
+async fn register(State(state): State<AppState>, Json(body): Json<Registration>) -> ApiResult<StatusCode> {
+    let email = body.email.trim().to_owned();
+    if email.parse::<lettre::Address>().is_err() {
+        return Err(bad_request("Enter a valid email address"));
+    }
     let username = body.username.trim().to_owned();
     let valid_name = (3..=20).contains(&username.chars().count())
         && username.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if !valid_name {
         return Err(bad_request("Username must be 3 to 20 letters, digits, '_' or '-'"));
     }
-    if body.password.chars().count() < 6 {
-        return Err(bad_request("Password must have at least 6 characters"));
-    }
-    let password = body.password.clone();
-    let hash = tokio::task::spawn_blocking(move || auth::hash_password(&password)).await.unwrap();
+    check_password(&body.password)?;
+    let hash = hash(body.password).await;
 
     let mut tx = state.db.begin().await?;
-    let code_ok: Option<i64> =
-        sqlx::query_scalar("SELECT 1 FROM invite_codes WHERE code = ? AND used_by IS NULL")
-            .bind(body.code.trim().to_uppercase())
-            .fetch_optional(&mut *tx)
-            .await?;
-    if code_ok.is_none() {
-        return Err(bad_request("This invite code is invalid or already used"));
-    }
-    let taken: Option<i64> = sqlx::query_scalar("SELECT 1 FROM users WHERE username = ?")
+    // Unconfirmed accounts for this email, and expired unconfirmed ones, free their email and username.
+    sqlx::query("DELETE FROM users WHERE email_verified_at IS NULL AND (email = ? OR created_at < ?)")
+        .bind(&email)
+        .bind(now() - VERIFY_TTL)
+        .execute(&mut *tx)
+        .await?;
+    let taken: Option<(String, String)> = sqlx::query_as("SELECT email, username FROM users WHERE email = ? OR username = ?")
+        .bind(&email)
         .bind(&username)
         .fetch_optional(&mut *tx)
         .await?;
-    if taken.is_some() {
-        return Err(ApiError(StatusCode::CONFLICT, "That username is taken".into()));
+    if let Some((taken_email, _)) = taken {
+        let msg = if taken_email.eq_ignore_ascii_case(&email) {
+            "That email is already registered. Log in or reset your password."
+        } else {
+            "That username is taken"
+        };
+        return Err(ApiError(StatusCode::CONFLICT, msg.into()));
     }
-    let user_id = sqlx::query("INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)")
+    // Inside the transaction, so a refused request leaves an earlier unconfirmed account in place.
+    rate_limit_email(&mut tx, &email).await?;
+    let user_id = sqlx::query("INSERT INTO users (email, username, password_hash, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&email)
         .bind(&username)
         .bind(hash)
         .bind(now())
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
-    sqlx::query("UPDATE invite_codes SET used_by = ?, used_at = ? WHERE code = ?")
-        .bind(user_id)
-        .bind(now())
-        .bind(body.code.trim().to_uppercase())
-        .execute(&mut *tx)
-        .await?;
     tx.commit().await?;
+
+    let token = create_token(&state.db, user_id, "verify", VERIFY_TTL).await?;
+    let link = format!("{}/verify?token={token}", state.base_url);
+    let body = format!(
+        "Hi {username},\n\nConfirm your email address to finish creating your SET account:\n\n{link}\n\n\
+         The link expires in 24 hours. If you did not register, ignore this email.\n"
+    );
+    send_mail(&state, &email, "Confirm your SET account", body).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Confirms the email of the token's account and logs it in.
+async fn verify(State(state): State<AppState>, Json(body): Json<TokenBody>) -> ApiResult<impl IntoResponse> {
+    let user_id = take_token(&state.db, &body.token, "verify").await?;
+    let username: String =
+        sqlx::query_scalar("UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ? RETURNING username")
+            .bind(now())
+            .bind(user_id)
+            .fetch_one(&state.db)
+            .await?;
     start_session(&state, user_id, username).await
 }
 
-async fn login(State(state): State<AppState>, Json(body): Json<Credentials>) -> ApiResult<impl IntoResponse> {
-    let row: Option<(i64, String, String)> =
-        sqlx::query_as("SELECT id, username, password_hash FROM users WHERE username = ?")
-            .bind(body.username.trim())
+async fn login(State(state): State<AppState>, Json(body): Json<Login>) -> ApiResult<impl IntoResponse> {
+    let row: Option<(i64, String, String, Option<i64>)> =
+        sqlx::query_as("SELECT id, username, password_hash, email_verified_at FROM users WHERE email = ?")
+            .bind(body.email.trim())
             .fetch_optional(&state.db)
             .await?;
-    let invalid = || ApiError(StatusCode::UNAUTHORIZED, "Invalid username or password".into());
-    let (id, username, hash) = row.ok_or_else(invalid)?;
+    let invalid = || ApiError(StatusCode::UNAUTHORIZED, "Invalid email or password".into());
+    let (id, username, hash, verified_at) = row.ok_or_else(invalid)?;
     let password = body.password;
     let ok = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash)).await.unwrap();
     if !ok {
         return Err(invalid());
     }
+    if verified_at.is_none() {
+        return Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Confirm your email first with the link we sent you, or register again to get a new link".into(),
+        ));
+    }
     start_session(&state, id, username).await
+}
+
+/// Emails a password reset link when an account uses the email. The response is the same
+/// either way, so it does not reveal which emails are registered.
+async fn forgot(State(state): State<AppState>, Json(body): Json<EmailOnly>) -> ApiResult<StatusCode> {
+    rate_limit_email(&mut *state.db.acquire().await?, body.email.trim()).await?;
+    let row: Option<(i64, String, String)> = sqlx::query_as("SELECT id, email, username FROM users WHERE email = ?")
+        .bind(body.email.trim())
+        .fetch_optional(&state.db)
+        .await?;
+    if let Some((user_id, email, username)) = row {
+        let token = create_token(&state.db, user_id, "reset", RESET_TTL).await?;
+        let link = format!("{}/reset?token={token}", state.base_url);
+        let body = format!(
+            "Hi {username},\n\nSet a new password for your SET account:\n\n{link}\n\n\
+             The link expires in 1 hour. If you did not ask for this, ignore this email.\n"
+        );
+        send_mail(&state, &email, "Reset your SET password", body).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sets a new password, logs out every other session, and logs in. Following the link
+/// also proves the email, so it confirms an unconfirmed account.
+async fn reset(State(state): State<AppState>, Json(body): Json<TokenBody>) -> ApiResult<impl IntoResponse> {
+    check_password(&body.password)?;
+    let user_id = take_token(&state.db, &body.token, "reset").await?;
+    let hash = hash(body.password).await;
+    let mut tx = state.db.begin().await?;
+    let username: String = sqlx::query_scalar(
+        "UPDATE users SET password_hash = ?, email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ? RETURNING username",
+    )
+    .bind(hash)
+    .bind(now())
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM email_tokens WHERE user_id = ? AND purpose = 'reset'").bind(user_id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    start_session(&state, user_id, username).await
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<impl IntoResponse> {
@@ -137,43 +300,19 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
 }
 
 async fn me(State(state): State<AppState>, user: CurrentUser) -> ApiResult<Json<Value>> {
-    let (played, wins): (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*), COALESCE(SUM(won), 0) FROM game_players WHERE user_id = ?")
-            .bind(user.id)
-            .fetch_one(&state.db)
-            .await?;
-    Ok(Json(json!({ "id": user.id, "username": user.username, "played": played, "wins": wins })))
-}
-
-async fn create_invite(State(state): State<AppState>, user: CurrentUser) -> ApiResult<Json<Value>> {
-    let code = db::random_code();
-    sqlx::query("INSERT INTO invite_codes (code, created_by, created_at) VALUES (?, ?, ?)")
-        .bind(&code)
-        .bind(user.id)
-        .bind(now())
-        .execute(&state.db)
-        .await?;
-    Ok(Json(json!({ "code": code })))
-}
-
-async fn list_invites(State(state): State<AppState>, user: CurrentUser) -> ApiResult<Json<Value>> {
-    let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT c.code, c.created_at, u.username FROM invite_codes c
-         LEFT JOIN users u ON u.id = c.used_by
-         WHERE c.created_by = ? ORDER BY c.created_at DESC, c.rowid DESC",
+    let (email, played, wins): (String, i64, i64) = sqlx::query_as(
+        "SELECT email, (SELECT COUNT(*) FROM game_players WHERE user_id = u.id),
+                (SELECT COALESCE(SUM(won), 0) FROM game_players WHERE user_id = u.id)
+         FROM users u WHERE id = ?",
     )
     .bind(user.id)
-    .fetch_all(&state.db)
+    .fetch_one(&state.db)
     .await?;
-    let codes: Vec<Value> = rows
-        .into_iter()
-        .map(|(code, created_at, used_by)| json!({ "code": code, "created_at": created_at, "used_by": used_by }))
-        .collect();
-    Ok(Json(json!(codes)))
+    Ok(Json(json!({ "id": user.id, "username": user.username, "email": email, "played": played, "wins": wins })))
 }
 
 async fn players(State(state): State<AppState>, _user: CurrentUser) -> ApiResult<Json<Value>> {
-    let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, username FROM users ORDER BY username")
+    let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, username FROM users WHERE email_verified_at IS NOT NULL ORDER BY username")
         .fetch_all(&state.db)
         .await?;
     Ok(Json(json!(rows.into_iter().map(|(id, username)| json!({ "id": id, "username": username })).collect::<Vec<_>>())))

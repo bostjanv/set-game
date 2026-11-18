@@ -1,7 +1,6 @@
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -23,35 +22,6 @@ pub async fn open(path: &str) -> Result<SqlitePool, Error> {
 
 pub fn random_token() -> String {
     rand::random::<[u8; 32]>().iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn random_code() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut rng = rand::thread_rng();
-    (0..10).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
-}
-
-/// While no user exists, returns an unused invite code that registers the first player.
-pub async fn bootstrap_code(pool: &SqlitePool) -> Result<Option<String>, Error> {
-    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(pool).await?;
-    if users > 0 {
-        return Ok(None);
-    }
-    let existing: Option<String> = sqlx::query_scalar(
-        "SELECT code FROM invite_codes WHERE created_by IS NULL AND used_by IS NULL LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await?;
-    if existing.is_some() {
-        return Ok(existing);
-    }
-    let code = random_code();
-    sqlx::query("INSERT INTO invite_codes (code, created_at) VALUES (?, ?)")
-        .bind(&code)
-        .bind(now())
-        .execute(pool)
-        .await?;
-    Ok(Some(code))
 }
 
 pub struct PlayerResult {

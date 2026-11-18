@@ -1,6 +1,7 @@
 export interface Me {
   id: number;
   username: string;
+  email: string;
   played: number;
   wins: number;
 }
@@ -82,7 +83,7 @@ export class Socket {
     ws.onmessage = (e) => this.onMessage(JSON.parse(e.data));
     ws.onclose = () => {
       this.onStatus(false);
-      if (!this.closed) setTimeout(() => this.open(), 1000);
+      setTimeout(() => this.closed || this.open(), 1000);
     };
   }
 

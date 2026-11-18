@@ -1,7 +1,9 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use set_server::mail::{Mail, Mailer};
 use set_server::rules::find_set;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -10,19 +12,22 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 struct Server {
     base: String,
+    outbox: Arc<Mutex<Vec<Mail>>>,
+    db: sqlx::SqlitePool,
 }
 
-async fn start_server() -> (Server, String) {
+async fn start_server() -> Server {
     let path = std::env::temp_dir().join(format!("set-test-{}-{}.db", std::process::id(), rand_suffix()));
     for ext in ["", "-wal", "-shm"] {
         std::fs::remove_file(format!("{}{ext}", path.display())).ok();
     }
-    let state = set_server::setup(path.to_str().unwrap()).await.unwrap();
-    let code = set_server::db::bootstrap_code(&state.db).await.unwrap().unwrap();
+    let outbox = Arc::new(Mutex::new(Vec::new()));
+    let state = set_server::setup(path.to_str().unwrap(), Mailer::Memory(outbox.clone()), "http://set.test/").await.unwrap();
+    let db = state.db.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
     tokio::spawn(async move { axum::serve(listener, set_server::router(state, None)).await.unwrap() });
-    (Server { base }, code)
+    Server { base, outbox, db }
 }
 
 /// Unique per test in this process, so parallel tests never share a database file.
@@ -38,27 +43,39 @@ struct User {
 }
 
 impl Server {
-    async fn register(&self, code: &str, name: &str) -> User {
+    async fn post(&self, http: &reqwest::Client, path: &str, body: Value) -> reqwest::Response {
+        http.post(format!("http://{}{path}", self.base)).json(&body).send().await.unwrap()
+    }
+
+    /// The token in the link of the last email sent to `to` that leads to `path`.
+    fn link_token(&self, to: &str, path: &str) -> String {
+        let outbox = self.outbox.lock().unwrap();
+        let mail = outbox.iter().rev().find(|m| m.to == to).unwrap_or_else(|| panic!("no email to {to}"));
+        let prefix = format!("http://set.test{path}?token=");
+        let start = mail.body.find(&prefix).unwrap_or_else(|| panic!("no {path} link in {mail:?}")) + prefix.len();
+        mail.body[start..].split_whitespace().next().unwrap().to_owned()
+    }
+
+    /// Registers `name` with the email `name@example.com` and confirms it, which logs in.
+    async fn register(&self, name: &str) -> User {
         let http = reqwest::Client::builder().cookie_store(true).build().unwrap();
-        let resp = http
-            .post(format!("http://{}/api/register", self.base))
-            .json(&json!({ "code": code, "username": name, "password": "secret1" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200, "register {name}");
+        let email = format!("{name}@example.com");
+        let resp = self.post(&http, "/api/register", json!({ "email": email, "username": name, "password": "secret1" })).await;
+        assert_eq!(resp.status(), 204, "register {name}");
+        let resp = self.post(&http, "/api/verify", json!({ "token": self.link_token(&email, "/verify") })).await;
+        assert_eq!(resp.status(), 200, "verify {name}");
         let cookie = resp.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
         let body: Value = resp.json().await.unwrap();
         User { http, cookie, id: body["id"].as_i64().unwrap() }
     }
 
-    async fn get(&self, user: &User, path: &str) -> Value {
-        user.http.get(format!("http://{}{path}", self.base)).send().await.unwrap().json().await.unwrap()
+    /// Moves the recorded email requests back in time, as if `secs` had passed.
+    async fn age_email_sends(&self, secs: i64) {
+        sqlx::query("UPDATE email_sends SET sent_at = sent_at - ?").bind(secs).execute(&self.db).await.unwrap();
     }
 
-    async fn new_code(&self, user: &User) -> String {
-        let v: Value = user.http.post(format!("http://{}/api/invites", self.base)).send().await.unwrap().json().await.unwrap();
-        v["code"].as_str().unwrap().to_owned()
+    async fn get(&self, user: &User, path: &str) -> Value {
+        user.http.get(format!("http://{}{path}", self.base)).send().await.unwrap().json().await.unwrap()
     }
 
     async fn connect(&self, user: &User) -> Ws {
@@ -120,25 +137,44 @@ fn score(game: &Value, id: i64) -> u64 {
 }
 
 #[tokio::test]
-async fn invite_only_registration() {
-    let (server, code) = start_server().await;
-    let alice = server.register(&code, "alice").await;
+async fn email_registration() {
+    let server = start_server().await;
+    let http = reqwest::Client::new();
+    let register = |email: &str, name: &str| {
+        server.post(&http, "/api/register", json!({ "email": email, "username": name, "password": "secret1" }))
+    };
+    let login = |email: &str, password: &str| server.post(&http, "/api/login", json!({ "email": email, "password": password }));
 
-    // The bootstrap code is single-use, and a bogus code is rejected.
-    for bad in [code.as_str(), "NOPE"] {
-        let resp = reqwest::Client::new()
-            .post(format!("http://{}/api/register", server.base))
-            .json(&json!({ "code": bad, "username": "mallory", "password": "secret1" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 400);
-    }
+    assert_eq!(register("not-an-email", "alice").await.status(), 400);
+    let resp = register("alice@example.com", "alice").await;
+    assert_eq!(resp.status(), 204);
+    assert!(resp.headers().get("set-cookie").is_none(), "no session before the email is confirmed");
+    let first = server.link_token("alice@example.com", "/verify");
 
-    let code = server.new_code(&alice).await;
-    server.register(&code, "bob").await;
-    let codes = server.get(&alice, "/api/invites").await;
-    assert_eq!(codes[0]["used_by"], "bob");
+    // Unconfirmed accounts cannot log in; a wrong password still reads as a wrong password.
+    assert_eq!(login("alice@example.com", "secret1").await.status(), 403);
+    assert_eq!(login("alice@example.com", "wrong!!").await.status(), 401);
+
+    // Registering the unconfirmed email again replaces the account, and only the new link works.
+    server.age_email_sends(61).await;
+    assert_eq!(register("ALICE@example.com", "alice2").await.status(), 204);
+    let resp = server.post(&http, "/api/verify", json!({ "token": first })).await;
+    assert_eq!(resp.status(), 400);
+    let alice = server.post(&http, "/api/verify", json!({ "token": server.link_token("ALICE@example.com", "/verify") })).await;
+    assert_eq!(alice.status(), 200);
+    assert_eq!(alice.json::<Value>().await.unwrap()["username"], "alice2");
+    assert_eq!(login("alice@example.com", "secret1").await.status(), 200);
+
+    // A confirmed email or username cannot be taken again.
+    assert_eq!(register("Alice@Example.com", "someone").await.status(), 409);
+    assert_eq!(register("other@example.com", "ALICE2").await.status(), 409);
+
+    // Players who have not confirmed their email are not listed.
+    assert_eq!(register("bob@example.com", "bob").await.status(), 204);
+    let carol = server.register("carol").await;
+    let players = server.get(&carol, "/api/players").await;
+    assert_eq!(players.as_array().unwrap().iter().map(|p| p["username"].clone()).collect::<Vec<_>>(), [json!("alice2"), json!("carol")]);
+    assert_eq!(server.get(&carol, "/api/me").await["email"], "carol@example.com");
 
     // Unauthenticated requests are refused.
     let resp = reqwest::get(format!("http://{}/api/players", server.base)).await.unwrap();
@@ -146,12 +182,81 @@ async fn invite_only_registration() {
 }
 
 #[tokio::test]
+async fn password_reset() {
+    let server = start_server().await;
+    let alice = server.register("alice").await;
+    server.age_email_sends(61).await;
+    let http = reqwest::Client::new();
+    let login = |password: &str| server.post(&http, "/api/login", json!({ "email": "alice@example.com", "password": password }));
+
+    // Unknown emails get the same answer and no email.
+    let sent = server.outbox.lock().unwrap().len();
+    assert_eq!(server.post(&http, "/api/forgot", json!({ "email": "nobody@example.com" })).await.status(), 204);
+    assert_eq!(server.outbox.lock().unwrap().len(), sent);
+
+    assert_eq!(server.post(&http, "/api/forgot", json!({ "email": "Alice@example.com" })).await.status(), 204);
+    let token = server.link_token("alice@example.com", "/reset");
+    // A confirmation link is not a reset link, and a too short password leaves the token usable.
+    let verify = server.post(&http, "/api/verify", json!({ "token": token })).await;
+    assert_eq!(verify.status(), 400);
+    let short = server.post(&http, "/api/reset", json!({ "token": token, "password": "short" })).await;
+    assert_eq!(short.status(), 400);
+    let resp = server.post(&http, "/api/reset", json!({ "token": token, "password": "newsecret" })).await;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("set-cookie").is_some(), "a reset logs in");
+
+    // The reset logs out the old session, and only the new password works.
+    let resp = alice.http.get(format!("http://{}/api/me", server.base)).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    assert_eq!(login("secret1").await.status(), 401);
+    assert_eq!(login("newsecret").await.status(), 200);
+    let again = server.post(&http, "/api/reset", json!({ "token": token, "password": "another1" })).await;
+    assert_eq!(again.status(), 400, "reset links are single-use");
+}
+
+#[tokio::test]
+async fn email_rate_limit() {
+    let server = start_server().await;
+    let http = reqwest::Client::new();
+    let forgot = |email: &str| server.post(&http, "/api/forgot", json!({ "email": email }));
+    let register = |name: &str| {
+        server.post(&http, "/api/register", json!({ "email": "bob@example.com", "username": name, "password": "secret1" }))
+    };
+    server.register("alice").await;
+    server.age_email_sends(61).await;
+
+    // One email per minute: the answer is the same for registered and unknown addresses.
+    for email in ["alice@example.com", "nobody@example.com"] {
+        assert_eq!(forgot(email).await.status(), 204);
+        assert_eq!(forgot(&email.to_uppercase()).await.status(), 429, "{email}");
+    }
+    assert_eq!(server.outbox.lock().unwrap().iter().filter(|m| m.subject.contains("Reset")).count(), 1);
+
+    // A refused registration leaves the earlier unconfirmed account and its link working.
+    assert_eq!(register("bob").await.status(), 204);
+    let token = server.link_token("bob@example.com", "/verify");
+    assert_eq!(register("bobby").await.status(), 429);
+    let resp = server.post(&http, "/api/verify", json!({ "token": token })).await;
+    assert_eq!(resp.json::<Value>().await.unwrap()["username"], "bob");
+
+    // Five emails per hour, counting only the last hour.
+    for _ in 0..3 {
+        server.age_email_sends(61).await;
+        assert_eq!(forgot("alice@example.com").await.status(), 204);
+    }
+    server.age_email_sends(61).await;
+    assert_eq!(forgot("alice@example.com").await.status(), 429, "sixth email within an hour");
+    server.age_email_sends(3600 - 5 * 61).await;
+    assert_eq!(forgot("alice@example.com").await.status(), 204, "the first email is over an hour old");
+}
+
+#[tokio::test]
 async fn full_game() {
-    let (server, code) = start_server().await;
-    let alice = server.register(&code, "alice").await;
-    let bob = server.register(&server.new_code(&alice).await, "bob").await;
-    let carol = server.register(&server.new_code(&alice).await, "carol").await;
-    let dave = server.register(&server.new_code(&alice).await, "dave").await;
+    let server = start_server().await;
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let carol = server.register("carol").await;
+    let dave = server.register("dave").await;
 
     let mut a = server.connect(&alice).await;
     let mut b = server.connect(&bob).await;
@@ -267,8 +372,8 @@ async fn full_game() {
 
 #[tokio::test]
 async fn solo_game_is_not_recorded() {
-    let (server, code) = start_server().await;
-    let alice = server.register(&code, "alice").await;
+    let server = start_server().await;
+    let alice = server.register("alice").await;
     let mut a = server.connect(&alice).await;
     a.send(json!({ "type": "create_game" })).await;
     a.until_game(|g| g["status"] == "waiting").await;
@@ -286,9 +391,9 @@ async fn solo_game_is_not_recorded() {
 
 #[tokio::test]
 async fn leader_leaving_cancels_waiting_game() {
-    let (server, code) = start_server().await;
-    let alice = server.register(&code, "alice").await;
-    let bob = server.register(&server.new_code(&alice).await, "bob").await;
+    let server = start_server().await;
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
     let mut a = server.connect(&alice).await;
     let mut b = server.connect(&bob).await;
     a.send(json!({ "type": "create_game" })).await;

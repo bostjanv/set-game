@@ -35,7 +35,7 @@ async fn run(socket: WebSocket, user: CurrentUser, state: AppState) {
             }
         };
         let invitee_name = match &msg {
-            ClientMsg::Invite { user_id } => sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE id = ?")
+            ClientMsg::Invite { user_id } => sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE id = ? AND email_verified_at IS NOT NULL")
                 .bind(user_id)
                 .fetch_optional(&state.db)
                 .await

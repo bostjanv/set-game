@@ -62,7 +62,7 @@ button.small { padding: 4px 10px; font-size: 0.85rem; margin-left: auto; }
 .invites { border-color: var(--accent); }
 .invites .row span { flex: 1; }
 
-ul.players, ul.codes, ul.scores { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+ul.players, ul.scores { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 ul.players li { display: flex; align-items: center; gap: 8px; min-height: 30px; }
 ul.players li.pending { color: var(--muted); }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: #c7ccd8; flex: none; }
@@ -75,10 +75,6 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: 500; font-size: 0.85rem; }
 tr.me td { font-weight: 700; }
 
-ul.codes li { display: flex; align-items: center; gap: 12px; }
-ul.codes code { font-size: 1.05rem; letter-spacing: 0.08em; }
-ul.codes .used { color: var(--muted); font-size: 0.9rem; }
-ul.codes { margin-top: 12px; }
 
 #board { flex: 1; min-height: 420px; position: relative; }
 #board canvas { position: absolute; inset: 0; }

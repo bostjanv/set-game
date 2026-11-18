@@ -35,10 +35,13 @@ function link(path: string, label: string) {
 }
 
 async function boot() {
-  try {
-    state.me = await api<Me>('GET', '/api/me');
-  } catch (e) {
-    if (!(e instanceof ApiError && e.status === 401)) throw e;
+  // A confirmation link logs in as its account, replacing any current session.
+  if (location.pathname !== '/verify') {
+    try {
+      state.me = await api<Me>('GET', '/api/me');
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 401)) throw e;
+    }
   }
   if (state.me) startSession();
   render();
@@ -48,8 +51,26 @@ function startSession() {
   state.socket = new Socket(onMessage, (connected) => {
     state.connected = connected;
     renderStatus();
+    if (!connected) checkSession();
   });
   refreshLists();
+}
+
+/** The browser hides why a WebSocket closed, so ask the API whether the session still exists. */
+async function checkSession() {
+  try {
+    await api('GET', '/api/me');
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 401) || !state.me) return;
+    endSession();
+    toast('Your session has ended. Log in again.', 'error');
+    navigate('/');
+  }
+}
+
+function endSession() {
+  state.socket?.close();
+  Object.assign(state, { me: null, socket: null, game: null, invites: [], online: new Set() });
 }
 
 async function refreshLists() {
@@ -112,9 +133,9 @@ function send(msg: Parameters<Socket['send']>[0]) {
   state.socket?.send(msg);
 }
 
-function route(): 'login' | 'register' | 'profile' | 'game' | 'lobby' {
+function route(): 'login' | 'register' | 'forgot' | 'reset' | 'verify' | 'profile' | 'game' | 'lobby' {
   const p = location.pathname;
-  if (p === '/register') return 'register';
+  if (p === '/register' || p === '/forgot' || p === '/reset' || p === '/verify') return p.slice(1) as 'register';
   if (!state.me) return 'login';
   if (p === '/profile') return 'profile';
   if (p === '/game' && state.game) return 'game';
@@ -134,6 +155,12 @@ function page(r: ReturnType<typeof route>): Node[] {
       return [loginForm()];
     case 'register':
       return [registerForm()];
+    case 'forgot':
+      return [forgotForm()];
+    case 'reset':
+      return [resetForm()];
+    case 'verify':
+      return [verifyPage()];
     case 'profile':
       return profilePage();
     case 'game':
@@ -162,7 +189,13 @@ function renderStatus() {
 
 // ---------- Login and registration ----------
 
-function form(title: string, fields: HTMLElement[], submit: string, onSubmit: (data: FormData) => Promise<void>, footer?: Node) {
+function form(
+  title: string,
+  fields: HTMLElement[],
+  submit: string,
+  onSubmit: (data: FormData, form: HTMLFormElement) => Promise<void>,
+  footer?: Node,
+) {
   const error = h('p', { class: 'form-error' });
   const button = h('button', { type: 'submit' }, submit);
   const el = h(
@@ -174,7 +207,7 @@ function form(title: string, fields: HTMLElement[], submit: string, onSubmit: (d
         error.textContent = '';
         button.disabled = true;
         try {
-          await onSubmit(new FormData(el));
+          await onSubmit(new FormData(el), el);
         } catch (err) {
           error.textContent = err instanceof Error ? err.message : String(err);
         } finally {
@@ -191,12 +224,19 @@ function form(title: string, fields: HTMLElement[], submit: string, onSubmit: (d
   return el;
 }
 
-function field(label: string, name: string, type = 'text', value = '') {
-  return h('label', {}, label, h('input', { name, type, value, required: true, autocomplete: type === 'password' ? 'current-password' : 'off' }));
+/** A card with a message, shown in place of a form once it is done. */
+function notice(title: string, text: string, footer?: Node) {
+  return h('section', { class: 'card auth' }, h('h1', {}, title), h('p', {}, text), footer);
 }
 
+function field(label: string, name: string, type = 'text', autocomplete = 'off') {
+  return h('label', {}, label, h('input', { name, type, required: true, autocomplete }));
+}
+
+const tokenParam = () => new URLSearchParams(location.search).get('token') ?? '';
+
 async function loggedIn(me: { id: number; username: string }) {
-  state.me = { ...me, played: 0, wins: 0 };
+  state.me = { ...me, email: '', played: 0, wins: 0 };
   await refreshMe();
   startSession();
   navigate('/');
@@ -205,33 +245,91 @@ async function loggedIn(me: { id: number; username: string }) {
 function loginForm() {
   return form(
     'Log in',
-    [field('Username', 'username'), field('Password', 'password', 'password')],
+    [field('Email', 'email', 'email', 'email'), field('Password', 'password', 'password', 'current-password')],
     'Log in',
-    async (d) => loggedIn(await api('POST', '/api/login', { username: d.get('username'), password: d.get('password') })),
-    h('p', { class: 'hint' }, 'New here? Ask a player for an invite link.'),
+    async (d) => loggedIn(await api('POST', '/api/login', { email: d.get('email'), password: d.get('password') })),
+    h(
+      'div',
+      {},
+      h('p', { class: 'hint' }, 'New here? ', link('/register', 'Create an account')),
+      h('p', { class: 'hint' }, link('/forgot', 'Forgot your password?')),
+    ),
   );
 }
 
 function registerForm() {
-  const code = new URLSearchParams(location.search).get('code') ?? '';
   return form(
     'Create your account',
-    [field('Invite code', 'code', 'text', code), field('Username', 'username'), field('Password', 'password', 'password')],
+    [
+      field('Email', 'email', 'email', 'email'),
+      field('Username', 'username', 'text', 'username'),
+      field('Password', 'password', 'password', 'new-password'),
+    ],
     'Register',
-    async (d) => {
-      if (state.me) await logout(false);
-      await loggedIn(
-        await api('POST', '/api/register', { code: d.get('code'), username: d.get('username'), password: d.get('password') }),
+    async (d, el) => {
+      await api('POST', '/api/register', { email: d.get('email'), username: d.get('username'), password: d.get('password') });
+      el.replaceWith(
+        notice(
+          'Check your email',
+          `We sent a confirmation link to ${d.get('email')}. Follow it within 24 hours to finish creating your account.`,
+        ),
       );
     },
     h('p', { class: 'hint' }, 'Already registered? ', link('/', 'Log in')),
   );
 }
 
+function forgotForm() {
+  return form(
+    'Reset your password',
+    [field('Email', 'email', 'email', 'email')],
+    'Send reset link',
+    async (d, el) => {
+      await api('POST', '/api/forgot', { email: d.get('email') });
+      el.replaceWith(
+        notice('Check your email', `If an account uses ${d.get('email')}, we sent it a link to set a new password. The link expires in 1 hour.`),
+      );
+    },
+    h('p', { class: 'hint' }, 'Remembered it? ', link('/', 'Log in')),
+  );
+}
+
+function resetForm() {
+  return form(
+    'Choose a new password',
+    [field('New password', 'password', 'password', 'new-password')],
+    'Set password',
+    async (d) => {
+      if (state.me) await logout(false);
+      await loggedIn(await api('POST', '/api/reset', { token: tokenParam(), password: d.get('password') }));
+    },
+    h('p', { class: 'hint' }, 'Link expired? ', link('/forgot', 'Get a new one')),
+  );
+}
+
+/** Confirms the email from the link in the confirmation email, which logs in. */
+function verifyPage() {
+  const el = notice('Confirming your email…', '');
+  (async () => {
+    try {
+      await loggedIn(await api('POST', '/api/verify', { token: tokenParam() }));
+      toast('Email confirmed. Welcome!', 'success');
+    } catch (err) {
+      el.replaceWith(
+        notice(
+          'This link does not work',
+          `${err instanceof Error ? err.message : err}. If your account is confirmed already, log in; otherwise register again to get a new link.`,
+          h('p', { class: 'hint' }, link('/', 'Log in'), ' · ', link('/register', 'Register')),
+        ),
+      );
+    }
+  })();
+  return el;
+}
+
 async function logout(go = true) {
   await api('POST', '/api/logout');
-  state.socket?.close();
-  Object.assign(state, { me: null, socket: null, game: null, invites: [], online: new Set() });
+  endSession();
   if (go) navigate('/');
 }
 
@@ -312,40 +410,14 @@ function leaderboardTable() {
 // ---------- Profile ----------
 
 function profilePage() {
-  const list = h('ul', { class: 'codes' }, h('li', { class: 'hint' }, 'Loading…'));
-  const load = async () => {
-    const codes = await api<{ code: string; used_by: string | null }[]>('GET', '/api/invites');
-    list.replaceChildren(
-      ...(codes.length ? [] : [h('li', { class: 'hint' }, 'No invite codes yet.')]),
-      ...codes.map((c) => {
-        const url = `${location.origin}/register?code=${c.code}`;
-        return h(
-          'li',
-          {},
-          h('code', {}, c.code),
-          c.used_by
-            ? h('span', { class: 'used' }, `used by ${c.used_by}`)
-            : h('button', { class: 'secondary', onclick: () => navigator.clipboard.writeText(url).then(() => toast('Link copied', 'success')) }, 'Copy link'),
-        );
-      }),
-    );
-  };
-  load();
   return [
     h(
       'section',
       { class: 'card' },
       h('h1', {}, state.me!.username),
+      h('p', { class: 'hint' }, state.me!.email),
       h('p', {}, `Games played: ${state.me!.played} · Wins: ${state.me!.wins}`),
       h('button', { class: 'secondary', onclick: () => logout() }, 'Log out'),
-    ),
-    h(
-      'section',
-      { class: 'card' },
-      h('h2', {}, 'Invite a new player'),
-      h('p', { class: 'hint' }, 'Each code registers one account. Share the link with the person you invite.'),
-      h('button', { onclick: async () => (await api('POST', '/api/invites'), load()) }, 'Create invite code'),
-      list,
     ),
   ];
 }
@@ -394,7 +466,7 @@ function waitingRoom(game: GameView) {
           { class: 'card' },
           h('h2', {}, 'Invite players'),
           candidates.length === 0
-            ? h('p', { class: 'hint' }, 'Everyone is already invited. Invite new people from your profile.')
+            ? h('p', { class: 'hint' }, 'Everyone is already invited.')
             : h(
                 'ul',
                 { class: 'players' },
