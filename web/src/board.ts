@@ -5,10 +5,14 @@ const W = 120;
 const H = 180;
 const GAP = 14;
 const PAD = 16;
-const CARD_COLORS = [0xd62e4d, 0x1d9a4c, 0x6a3fb5];
 const SELECT_COLOR = 0xf5b301;
 const ERROR_COLOR = 0xe11d48;
-const BORDER_COLOR = 0xd5d8e0;
+/** Card face, symbol colors (red, green, purple), and card outline for each theme. */
+const PALETTES = {
+  light: { face: 0xffffff, symbols: [0xd62e4d, 0x1d9a4c, 0x6a3fb5], border: 0xd5d8e0 },
+  dark: { face: 0x232a39, symbols: [0xf2577a, 0x35c46f, 0xa883f5], border: 0x3a4255 },
+};
+type Palette = (typeof PALETTES)['light'];
 
 /** Card numbers encode their attributes in base 3, as on the server. */
 export function attrs(card: number) {
@@ -37,11 +41,11 @@ function shapePath(g: Graphics, shape: number, cx: number, cy: number, w: number
   }
 }
 
-function buildCard(card: number): Container {
+function buildCard(card: number, palette: Palette): Container {
   const { count, shape, color, shading } = attrs(card);
-  const fill = CARD_COLORS[color];
+  const fill = palette.symbols[color];
   const c = new Container();
-  c.addChild(new Graphics().roundRect(0, 0, W, H, 12).fill(0xffffff));
+  c.addChild(new Graphics().roundRect(0, 0, W, H, 12).fill(palette.face));
   const sw = 82, sh = 34, gap = 14;
   const total = count * sh + (count - 1) * gap;
   for (let i = 0; i < count; i++) {
@@ -96,14 +100,19 @@ export class Board {
   private slots = new Map<number, Slot>();
   private table: number[] = [];
   private selected = new Set<number>();
+  /** Cards shaking after a wrong claim keep their red glow until the shake ends. */
+  private shaking = new Set<number>();
   private pending = false;
   private locked = false;
   private lastSeq: number | null = null;
   private anims: Anim[] = [];
   private resizer = new ResizeObserver(() => this.resize());
+  private palette: Palette;
 
   /** `onSubmit` is called with three cards when the player selects a third card. */
-  constructor(private host: HTMLElement, private onSubmit: (cards: number[]) => void) {}
+  constructor(private host: HTMLElement, dark: boolean, private onSubmit: (cards: number[]) => void) {
+    this.palette = dark ? PALETTES.dark : PALETTES.light;
+  }
 
   async init() {
     await this.app.init({
@@ -114,6 +123,7 @@ export class Board {
       width: this.host.clientWidth || 800,
       height: this.host.clientHeight || 600,
     });
+    this.app.stage.sortableChildren = true;
     this.host.appendChild(this.app.canvas);
     this.app.ticker.add(() => this.tick());
     this.resizer.observe(this.host);
@@ -139,6 +149,7 @@ export class Board {
       if (table.includes(card)) continue;
       this.slots.delete(card);
       this.selected.delete(card);
+      this.shaking.delete(card);
       if (flash?.cards.includes(card)) this.flashOut(slot, flash.color);
       else slot.root.destroy({ children: true });
     }
@@ -166,9 +177,11 @@ export class Board {
       const slot = this.slots.get(card);
       if (!slot) continue;
       const x = slot.root.x;
-      this.drawFrame(slot, ERROR_COLOR, 6);
+      this.shaking.add(card);
+      this.drawGlow(slot, ERROR_COLOR);
       this.animate(slot.root, 0, 380, (t) => (slot.root.x = x + Math.sin(t * Math.PI * 6) * 8 * (1 - t)), () => {
         slot.root.x = x;
+        this.shaking.delete(card);
         this.redrawFrames();
       });
     }
@@ -183,7 +196,7 @@ export class Board {
   private texture(card: number) {
     let t = this.textures.get(card);
     if (!t) {
-      const c = buildCard(card);
+      const c = buildCard(card, this.palette);
       t = this.app.renderer.generateTexture({ target: c, resolution: 3, antialias: true });
       c.destroy({ children: true });
       this.textures.set(card, t);
@@ -217,25 +230,38 @@ export class Board {
     }
   }
 
-  private drawFrame(slot: Slot, color: number, width: number) {
-    slot.frame.clear().roundRect(-W / 2 - 5, -H / 2 - 5, W + 10, H + 10, 16).stroke({ width, color });
+  /** A thin outline on the card's edge and rings outside it fading outward like a glow; nothing is drawn under the card, so it can fade out cleanly. */
+  private drawGlow(slot: Slot, color: number) {
+    slot.frame.clear();
+    for (let i = 0; i < 12; i++) {
+      const d = i * 1.5 + 0.75;
+      slot.frame.roundRect(-W / 2 - d, -H / 2 - d, W + 2 * d, H + 2 * d, 12 + d).stroke({ width: 1.5, color, alpha: 0.6 * (1 - i / 12) ** 2 });
+    }
+    slot.border.clear().roundRect(-W / 2 + 1, -H / 2 + 1, W - 2, H - 2, 11).stroke({ width: 2.5, color });
   }
 
   private redrawFrames() {
     for (const slot of this.slots.values()) {
+      if (this.shaking.has(slot.card)) continue;
       slot.frame.clear();
-      const color = this.selected.has(slot.card) ? SELECT_COLOR : BORDER_COLOR;
+      const color = this.selected.has(slot.card) ? SELECT_COLOR : this.palette.border;
       slot.border.clear().roundRect(-W / 2, -H / 2, W, H, 12).stroke({ width: 2, color });
     }
   }
 
+  /** Lifts a claimed card with a soft glow in the claimer's color, then fades it out above the card replacing it. */
   private flashOut(slot: Slot, color: number) {
-    this.drawFrame(slot, color, 8);
     slot.root.eventMode = 'none';
+    slot.root.zIndex = 1;
+    this.drawGlow(slot, color);
     const s = slot.root.scale.x;
-    this.animate(slot.root, 150, 400, (t) => {
+    this.animate(slot.frame, 0, 160, (t) => {
+      slot.frame.alpha = t;
+      slot.root.scale.set(s * (1 + 0.04 * t));
+    });
+    this.animate(slot.root, 260, 320, (t) => {
       slot.root.alpha = 1 - t;
-      slot.root.scale.set(s * (1 + 0.12 * t));
+      slot.root.scale.set(s * (1.04 - 0.1 * t));
     }, () => slot.root.destroy({ children: true }));
   }
 

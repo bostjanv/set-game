@@ -116,10 +116,6 @@ function onMessage(msg: ServerMsg) {
       return;
     }
     case 'claim_result':
-      if (msg.result === 'ok') toast('Set!', 'success');
-      if (msg.result === 'not_a_set') toast('Not a set: 10 second lockout', 'error');
-      if (msg.result === 'stale') toast('Too slow, those cards are gone');
-      if (msg.result === 'locked') toast('You are locked out for a moment', 'error');
       board?.clearSelection(msg.result === 'not_a_set');
       return;
     case 'error':
@@ -144,6 +140,21 @@ function route(): 'login' | 'register' | 'forgot' | 'reset' | 'verify' | 'profil
   if (p === '/game' && state.game) return 'game';
   return 'lobby';
 }
+
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+/** The theme the player picked in the header, else the system's. */
+const isDark = () => (localStorage.getItem('theme') ?? (darkQuery.matches ? 'dark' : 'light')) === 'dark';
+
+const applyTheme = () => (document.documentElement.dataset.theme = isDark() ? 'dark' : 'light');
+
+/** Switches the theme and rebuilds the page; the board draws its cards for one theme. */
+function switchTheme(theme?: 'light' | 'dark') {
+  if (theme) localStorage.setItem('theme', theme);
+  applyTheme();
+  teardownBoard();
+  render();
+}
+darkQuery.addEventListener('change', () => switchTheme());
 
 function render() {
   const r = route();
@@ -179,7 +190,14 @@ function header() {
     {},
     h('a', { class: 'logo', href: BASE + '/', onclick: (e: Event) => (e.preventDefault(), navigate(state.game ? '/game' : '/')) }, 'SET'),
     h('span', { id: 'conn', class: state.connected ? 'on' : 'off' }, state.connected ? 'online' : 'connecting…'),
-    h('nav', {}, state.game ? link('/game', 'Current game') : null, link('/', 'Lobby'), link('/profile', state.me!.username)),
+    h(
+      'nav',
+      {},
+      state.game ? link('/game', 'Current game') : null,
+      link('/', 'Lobby'),
+      link('/profile', state.me!.username),
+      h('button', { class: 'theme', title: isDark() ? 'Light theme' : 'Dark theme', onclick: () => switchTheme(isDark() ? 'light' : 'dark') }, isDark() ? '☀' : '☾'),
+    ),
   );
 }
 
@@ -530,7 +548,7 @@ function mountBoard(game: GameView) {
     teardownBoard();
     boardHost = host;
     boardGameId = game.id;
-    const b = new Board(host, (cards) => send({ type: 'claim', cards }));
+    const b = new Board(host, isDark(), (cards) => send({ type: 'claim', cards }));
     board = b;
     b.init().then(() => {
       if (board === b && state.game) updatePlaying(state.game);
@@ -581,4 +599,5 @@ function results(game: GameView) {
   ];
 }
 
+applyTheme();
 boot();
