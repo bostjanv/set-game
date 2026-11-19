@@ -38,6 +38,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/register", post(register))
         .route("/api/verify", post(verify))
+        .route("/api/verify/resend", post(resend_verify))
         .route("/api/login", post(login))
         .route("/api/forgot", post(forgot))
         .route("/api/reset", post(reset))
@@ -48,11 +49,10 @@ pub fn routes() -> Router<AppState> {
         .route("/ws", get(ws::handler))
 }
 
-/// How long a confirmation code works; unconfirmed accounts older than this are deleted.
-const VERIFY_TTL: i64 = 30 * 60;
-/// Wrong guesses allowed per confirmation code, so it cannot be brute-forced.
-const VERIFY_ATTEMPTS: i64 = 5;
-const RESET_TTL: i64 = 3600;
+/// How long an emailed code works. Unconfirmed accounts without a working code are deleted.
+const CODE_TTL: i64 = 30 * 60;
+/// Wrong guesses allowed per emailed code, so it cannot be brute-forced.
+const CODE_ATTEMPTS: i64 = 5;
 
 #[derive(Deserialize)]
 struct Registration {
@@ -73,14 +73,11 @@ struct EmailOnly {
 }
 
 #[derive(Deserialize)]
-struct TokenBody {
-    token: String,
-    password: String,
-}
-
-#[derive(Deserialize)]
 struct CodeBody {
     code: String,
+    /// The new password, for `reset`.
+    #[serde(default)]
+    password: String,
 }
 
 fn check_password(password: &str) -> ApiResult<()> {
@@ -108,28 +105,67 @@ async fn start_session(state: &AppState, user_id: i64, username: String) -> ApiR
     ))
 }
 
-/// Stores a new single-use token for the user and returns it.
-async fn create_token(db: &SqlitePool, user_id: i64, purpose: &str, ttl: i64) -> ApiResult<String> {
-    let token = db::random_token();
-    sqlx::query("INSERT INTO email_tokens (token, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)")
+fn new_code() -> String {
+    format!("{:06}", rand::Rng::gen_range(&mut rand::thread_rng(), 0..1_000_000))
+}
+
+/// Stores a new code for the user's `purpose`, replacing an earlier one, and returns the secret
+/// for the browser's cookie and the code to email.
+async fn create_code(conn: &mut sqlx::SqliteConnection, user_id: i64, purpose: &str) -> ApiResult<(String, String)> {
+    sqlx::query("DELETE FROM email_codes WHERE expires_at <= ? OR (user_id = ? AND purpose = ?)")
+        .bind(now())
+        .bind(user_id)
+        .bind(purpose)
+        .execute(&mut *conn)
+        .await?;
+    let (token, code) = (db::random_token(), new_code());
+    sqlx::query("INSERT INTO email_codes (token, user_id, purpose, code, expires_at) VALUES (?, ?, ?, ?, ?)")
         .bind(&token)
         .bind(user_id)
         .bind(purpose)
-        .bind(now() + ttl)
-        .execute(db)
+        .bind(&code)
+        .bind(now() + CODE_TTL)
+        .execute(conn)
         .await?;
-    Ok(token)
+    Ok((token, code))
 }
 
-/// Deletes the token and returns its user, or fails when it is unknown, used, or expired.
-async fn take_token(db: &SqlitePool, token: &str, purpose: &str) -> ApiResult<i64> {
-    sqlx::query_scalar("DELETE FROM email_tokens WHERE token = ? AND purpose = ? AND expires_at > ? RETURNING user_id")
-        .bind(token)
-        .bind(purpose)
-        .bind(now())
+/// Checks `code` against the one emailed to the browser whose `purpose` cookie the request
+/// carries, and deletes it and returns its user when it matches. Without the cookie the code is
+/// useless, so intercepting the email is not enough. Wrong reset codes all get the same answer,
+/// so it does not reveal whether `/api/forgot` found an account.
+async fn take_code(db: &SqlitePool, headers: &HeaderMap, purpose: &str, code: &str) -> ApiResult<i64> {
+    let verify = purpose == "verify";
+    let token = auth::cookie(headers, purpose).ok_or_else(|| {
+        bad_request(if verify {
+            "Enter the code in the browser where you registered, or register again here."
+        } else {
+            "Enter the code in the browser where you asked for it, or ask for a new one here."
+        })
+    })?;
+    let invalid = || bad_request(if verify { "This code has expired. Send a new one." } else { "This code is wrong or has expired." });
+    // Counts the guess before comparing, so concurrent guesses cannot exceed the limit.
+    let (expected, attempts): (String, i64) = sqlx::query_as(
+        "UPDATE email_codes SET attempts = attempts + 1
+         WHERE token = ? AND purpose = ? AND expires_at > ? AND attempts < ? RETURNING code, attempts",
+    )
+    .bind(&token)
+    .bind(purpose)
+    .bind(now())
+    .bind(CODE_ATTEMPTS)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(invalid)?;
+    if code.trim() != expected {
+        let left = CODE_ATTEMPTS - attempts;
+        return Err(if verify && left > 0 { bad_request(&format!("Wrong code. {left} attempts left.")) } else { invalid() });
+    }
+    // Deleting claims the code, so it works only once.
+    sqlx::query_scalar("DELETE FROM email_codes WHERE token = ? RETURNING user_id")
+        .bind(&token)
         .fetch_optional(db)
         .await?
-        .ok_or_else(|| bad_request("This link is invalid or has expired"))
+        .ok_or_else(invalid)
 }
 
 /// Records a request to email `email`, or fails with 429 when the address already had one in
@@ -183,12 +219,16 @@ async fn register(State(state): State<AppState>, Json(body): Json<Registration>)
     let hash = hash(body.password).await;
 
     let mut tx = state.db.begin().await?;
-    // Unconfirmed accounts for this email, and expired unconfirmed ones, free their email and username.
-    sqlx::query("DELETE FROM users WHERE email_verified_at IS NULL AND (email = ? OR created_at < ?)")
-        .bind(&email)
-        .bind(now() - VERIFY_TTL)
-        .execute(&mut *tx)
-        .await?;
+    // Unconfirmed accounts for this email, and unconfirmed ones whose code has expired, free their
+    // email and username.
+    sqlx::query(
+        "DELETE FROM users WHERE email_verified_at IS NULL AND (email = ? OR NOT EXISTS
+           (SELECT 1 FROM email_codes c WHERE c.user_id = users.id AND c.purpose = 'verify' AND c.expires_at > ?))",
+    )
+    .bind(&email)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
     let taken: Option<(String, String)> = sqlx::query_as("SELECT email, username FROM users WHERE email = ? OR username = ?")
         .bind(&email)
         .bind(&username)
@@ -212,60 +252,56 @@ async fn register(State(state): State<AppState>, Json(body): Json<Registration>)
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
-    let token = db::random_token();
-    let code = format!("{:06}", rand::Rng::gen_range(&mut rand::thread_rng(), 0..1_000_000));
-    sqlx::query("INSERT INTO verifications (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)")
-        .bind(&token)
-        .bind(user_id)
-        .bind(&code)
-        .bind(now() + VERIFY_TTL)
-        .execute(&mut *tx)
-        .await?;
+    let (token, code) = create_code(&mut tx, user_id, "verify").await?;
     tx.commit().await?;
+    send_mail(&state, &email, "Your SET confirmation code", verify_mail(&username, &code)).await?;
+    Ok((AppendHeaders([(SET_COOKIE, auth::code_cookie("verify", &token, CODE_TTL))]), StatusCode::NO_CONTENT))
+}
 
-    let body = format!(
+fn verify_mail(username: &str, code: &str) -> String {
+    format!(
         "Hi {username},\n\nYour SET confirmation code is:\n\n{code}\n\n\
          Enter it on the page where you registered. It expires in 30 minutes.\n\
          If you did not register, ignore this email.\n"
-    );
-    send_mail(&state, &email, "Your SET confirmation code", body).await?;
-    Ok((AppendHeaders([(SET_COOKIE, auth::verify_cookie(&token, VERIFY_TTL))]), StatusCode::NO_CONTENT))
+    )
 }
 
 /// Confirms the email of the account this browser registered when `code` is the emailed one,
-/// and logs it in. Without the `verify` cookie the code is useless, so intercepting it is not enough.
+/// and logs it in.
 async fn verify(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<CodeBody>) -> ApiResult<impl IntoResponse> {
-    let expired = || bad_request("This code has expired. Register again to get a new one.");
-    let token = auth::cookie(&headers, auth::VERIFY_COOKIE)
-        .ok_or_else(|| bad_request("Enter the code in the browser where you registered, or register again here."))?;
-    // Counts the guess before comparing, so concurrent guesses cannot exceed the limit.
-    let (code, attempts): (String, i64) = sqlx::query_as(
-        "UPDATE verifications SET attempts = attempts + 1 WHERE token = ? AND expires_at > ? AND attempts < ? RETURNING code, attempts",
-    )
-    .bind(&token)
-    .bind(now())
-    .bind(VERIFY_ATTEMPTS)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(expired)?;
-    if body.code.trim() != code {
-        let left = VERIFY_ATTEMPTS - attempts;
-        return Err(if left == 0 { expired() } else { bad_request(&format!("Wrong code. {left} attempts left.")) });
-    }
-    let mut tx = state.db.begin().await?;
-    // Deleting claims the code, so it confirms and logs in only once.
-    let user_id: i64 = sqlx::query_scalar("DELETE FROM verifications WHERE token = ? RETURNING user_id")
-        .bind(&token)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(expired)?;
+    let user_id = take_code(&state.db, &headers, "verify", &body.code).await?;
     let username: String = sqlx::query_scalar("UPDATE users SET email_verified_at = ? WHERE id = ? RETURNING username")
         .bind(now())
         .bind(user_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&state.db)
+        .await?;
+    Ok((AppendHeaders([(SET_COOKIE, auth::code_cookie("verify", "", 0))]), start_session(&state, user_id, username).await?))
+}
+
+/// Emails a new confirmation code to the account this browser registered, with fresh attempts.
+/// The browser keeps its cookie.
+async fn resend_verify(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<StatusCode> {
+    let gone = || bad_request("This registration has expired. Register again.");
+    let token = auth::cookie(&headers, "verify").ok_or_else(gone)?;
+    let mut tx = state.db.begin().await?;
+    let (email, username): (String, String) = sqlx::query_as(
+        "SELECT u.email, u.username FROM email_codes c JOIN users u ON u.id = c.user_id WHERE c.token = ? AND c.purpose = 'verify'",
+    )
+    .bind(&token)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(gone)?;
+    rate_limit_email(&mut tx, &email).await?;
+    let code = new_code();
+    sqlx::query("UPDATE email_codes SET code = ?, attempts = 0, expires_at = ? WHERE token = ?")
+        .bind(&code)
+        .bind(now() + CODE_TTL)
+        .bind(&token)
+        .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok((AppendHeaders([(SET_COOKIE, auth::verify_cookie("", 0))]), start_session(&state, user_id, username).await?))
+    send_mail(&state, &email, "Your SET confirmation code", verify_mail(&username, &code)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn login(State(state): State<AppState>, Json(body): Json<Login>) -> ApiResult<impl IntoResponse> {
@@ -290,31 +326,36 @@ async fn login(State(state): State<AppState>, Json(body): Json<Login>) -> ApiRes
     start_session(&state, id, username).await
 }
 
-/// Emails a password reset link when an account uses the email. The response is the same
-/// either way, so it does not reveal which emails are registered.
-async fn forgot(State(state): State<AppState>, Json(body): Json<EmailOnly>) -> ApiResult<StatusCode> {
-    rate_limit_email(&mut *state.db.acquire().await?, body.email.trim()).await?;
+/// Emails a password reset code when an account uses the email, and sets this browser's `reset`
+/// cookie either way, so the response does not reveal which emails are registered. Asking again
+/// replaces the code.
+async fn forgot(State(state): State<AppState>, Json(body): Json<EmailOnly>) -> ApiResult<impl IntoResponse> {
+    let mut conn = state.db.acquire().await?;
+    rate_limit_email(&mut conn, body.email.trim()).await?;
     let row: Option<(i64, String, String)> = sqlx::query_as("SELECT id, email, username FROM users WHERE email = ?")
         .bind(body.email.trim())
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *conn)
         .await?;
+    // Without an account the cookie leads to no code, and every code entered is wrong.
+    let mut token = db::random_token();
     if let Some((user_id, email, username)) = row {
-        let token = create_token(&state.db, user_id, "reset", RESET_TTL).await?;
-        let link = format!("{}/reset?token={token}", state.base_url);
+        let code;
+        (token, code) = create_code(&mut conn, user_id, "reset").await?;
         let body = format!(
-            "Hi {username},\n\nSet a new password for your SET account:\n\n{link}\n\n\
-             The link expires in 1 hour. If you did not ask for this, ignore this email.\n"
+            "Hi {username},\n\nYour SET password reset code is:\n\n{code}\n\n\
+             Enter it on the page where you asked for it. It expires in 30 minutes.\n\
+             If you did not ask for this, ignore this email.\n"
         );
         send_mail(&state, &email, "Reset your SET password", body).await?;
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok((AppendHeaders([(SET_COOKIE, auth::code_cookie("reset", &token, CODE_TTL))]), StatusCode::NO_CONTENT))
 }
 
-/// Sets a new password, logs out every other session, and logs in. Following the link
-/// also proves the email, so it confirms an unconfirmed account.
-async fn reset(State(state): State<AppState>, Json(body): Json<TokenBody>) -> ApiResult<impl IntoResponse> {
+/// Sets a new password when `code` is the one emailed to this browser, logs out every other
+/// session, and logs in. The code also proves the email, so it confirms an unconfirmed account.
+async fn reset(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<CodeBody>) -> ApiResult<impl IntoResponse> {
     check_password(&body.password)?;
-    let user_id = take_token(&state.db, &body.token, "reset").await?;
+    let user_id = take_code(&state.db, &headers, "reset", &body.code).await?;
     let hash = hash(body.password).await;
     let mut tx = state.db.begin().await?;
     let username: String = sqlx::query_scalar(
@@ -326,9 +367,8 @@ async fn reset(State(state): State<AppState>, Json(body): Json<TokenBody>) -> Ap
     .fetch_one(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM sessions WHERE user_id = ?").bind(user_id).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM email_tokens WHERE user_id = ? AND purpose = 'reset'").bind(user_id).execute(&mut *tx).await?;
     tx.commit().await?;
-    start_session(&state, user_id, username).await
+    Ok((AppendHeaders([(SET_COOKIE, auth::code_cookie("reset", "", 0))]), start_session(&state, user_id, username).await?))
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<impl IntoResponse> {

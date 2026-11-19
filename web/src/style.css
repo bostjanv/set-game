@@ -91,6 +91,8 @@ button {
 button:hover { filter: brightness(1.1); }
 button:disabled { opacity: 0.6; cursor: default; }
 button.secondary { background: var(--secondary); color: var(--text); }
+/* A button that looks like a link, for actions inside a line of text. */
+button.link { padding: 0; background: none; color: var(--accent); font-weight: inherit; text-decoration: underline; }
 button.small { padding: 4px 10px; font-size: 0.85rem; margin-left: auto; }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
 .invites .row { margin-top: 8px; }

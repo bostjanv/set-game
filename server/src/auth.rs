@@ -10,8 +10,6 @@ use crate::api::ApiError;
 use crate::AppState;
 
 pub const COOKIE_NAME: &str = "sid";
-/// Holds the secret of a pending email confirmation, so only the registering browser can enter its code.
-pub const VERIFY_COOKIE: &str = "verify";
 
 pub fn hash_password(password: &str) -> String {
     let salt = SaltString::encode_b64(&rand::random::<[u8; 16]>()).expect("16 bytes is a valid salt");
@@ -35,8 +33,10 @@ pub fn clear_cookie() -> String {
     format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
-pub fn verify_cookie(token: &str, max_age: i64) -> String {
-    format!("{VERIFY_COOKIE}={token}; Path=/api; HttpOnly; SameSite=Strict; Max-Age={max_age}")
+/// The cookie named after an email code's purpose (`verify` or `reset`). It holds the secret
+/// of the browser that asked for the code, so only that browser can enter it.
+pub fn code_cookie(purpose: &str, token: &str, max_age: i64) -> String {
+    format!("{purpose}={token}; Path=/api; HttpOnly; SameSite=Strict; Max-Age={max_age}")
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {

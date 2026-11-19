@@ -242,16 +242,9 @@ function form(
   return el;
 }
 
-/** A card with a message, shown in place of a form once it is done. */
-function notice(title: string, text: string, footer?: Node) {
-  return h('section', { class: 'card auth' }, h('h1', {}, title), h('p', {}, text), footer);
-}
-
 function field(label: string, name: string, type = 'text', autocomplete = 'off') {
   return h('label', {}, label, h('input', { name, type, required: true, autocomplete }));
 }
-
-const tokenParam = () => new URLSearchParams(location.search).get('token') ?? '';
 
 async function loggedIn(me: { id: number; username: string }) {
   state.me = { ...me, email: '', played: 0, wins: 0 };
@@ -296,50 +289,96 @@ function forgotForm() {
   return form(
     'Reset your password',
     [field('Email', 'email', 'email', 'email')],
-    'Send reset link',
-    async (d, el) => {
+    'Send reset code',
+    async (d) => {
       await api('POST', '/api/forgot', { email: d.get('email') });
-      el.replaceWith(
-        notice('Check your email', `If an account uses ${d.get('email')}, we sent it a link to set a new password. The link expires in 1 hour.`),
-      );
+      navigate(`/reset?email=${encodeURIComponent(String(d.get('email')))}`);
     },
     h('p', { class: 'hint' }, 'Remembered it? ', link('/', 'Log in')),
   );
 }
 
+function codeField() {
+  return h(
+    'label',
+    {},
+    'Code from the email',
+    h('input', { name: 'code', required: true, inputmode: 'numeric', pattern: '\\d{6}', maxlength: 6, autocomplete: 'one-time-code' }),
+  );
+}
+
+/** A link-styled button that asks for a new code and reports the result in a toast. */
+function resendButton(send: () => Promise<unknown>) {
+  const button = h(
+    'button',
+    {
+      type: 'button',
+      class: 'link',
+      onclick: async () => {
+        button.disabled = true;
+        try {
+          await send();
+          toast('We sent you a new code', 'success');
+        } catch (err) {
+          toast(err instanceof Error ? err.message : String(err), 'error');
+        } finally {
+          button.disabled = false;
+        }
+      },
+    },
+    'Resend code',
+  );
+  return button;
+}
+
+const emailParam = () => new URLSearchParams(location.search).get('email');
+
+/** Sets a new password with the emailed code, which logs in. Works only in the browser that asked for it. */
 function resetForm() {
+  const email = emailParam();
   return form(
     'Choose a new password',
-    [field('New password', 'password', 'password', 'new-password')],
+    [
+      h('p', {}, `If an account uses ${email ?? 'your email'}, we sent it a 6-digit code. Enter it here within 30 minutes.`),
+      codeField(),
+      field('New password', 'password', 'password', 'new-password'),
+    ],
     'Set password',
     async (d) => {
       if (state.me) await logout(false);
-      await loggedIn(await api('POST', '/api/reset', { token: tokenParam(), password: d.get('password') }));
+      await loggedIn(await api('POST', '/api/reset', { code: d.get('code'), password: d.get('password') }));
     },
-    h('p', { class: 'hint' }, 'Link expired? ', link('/forgot', 'Get a new one')),
+    h(
+      'p',
+      { class: 'hint' },
+      'No code, or it expired? ',
+      // Asking again sets a new code for this browser, the same way the first request did.
+      email ? resendButton(() => api('POST', '/api/forgot', { email })) : link('/forgot', 'Get a new one'),
+    ),
   );
 }
 
 /** Confirms the email with the emailed code, which logs in. Works only in the browser that registered. */
 function verifyPage() {
-  const email = new URLSearchParams(location.search).get('email');
   return form(
     'Check your email',
     [
-      h('p', {}, `We sent a 6-digit code to ${email ?? 'your email'}. Enter it here within 30 minutes to finish creating your account.`),
-      h(
-        'label',
-        {},
-        'Confirmation code',
-        h('input', { name: 'code', required: true, inputmode: 'numeric', pattern: '\\d{6}', maxlength: 6, autocomplete: 'one-time-code' }),
-      ),
+      h('p', {}, `We sent a 6-digit code to ${emailParam() ?? 'your email'}. Enter it here within 30 minutes to finish creating your account.`),
+      codeField(),
     ],
     'Confirm',
     async (d) => {
       await loggedIn(await api('POST', '/api/verify', { code: d.get('code') }));
       toast('Email confirmed. Welcome!', 'success');
     },
-    h('p', { class: 'hint' }, 'No code, or it expired? ', link('/register', 'Register again')),
+    h(
+      'p',
+      { class: 'hint' },
+      'No code? ',
+      resendButton(() => api('POST', '/api/verify/resend')),
+      ' or ',
+      link('/register', 'register again'),
+    ),
   );
 }
 

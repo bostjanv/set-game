@@ -22,11 +22,11 @@ A multiplayer SET card game. The Rust server (`server/`: axum, sqlx with SQLite)
 
 ## Accounts
 
-- Registration is open and email based: `POST /api/register` creates an account with `email_verified_at` NULL and emails a 6-digit code (30 minutes). It also sets the HttpOnly `verify` cookie, the key of the code's row in `verifications`, so `POST /api/verify` with `{code}` confirms the email and logs in only in the browser that registered: an intercepted email is not enough. Each code allows 5 guesses. Unconfirmed accounts cannot log in and are not listed or invitable.
-- Registering an email that is still unconfirmed replaces that account; unconfirmed accounts older than 30 minutes are deleted on the next registration, freeing their username.
+- Registration and password reset use 6-digit codes sent by email (table `email_codes`, 30 minutes, 5 guesses each, single use). The request that sends a code also sets an HttpOnly cookie named after its purpose (`verify` or `reset`) holding the row's secret, and the code is accepted only with that cookie, so an intercepted email is not enough: the code must be entered in the browser that asked for it.
+- `POST /api/register` creates an account with `email_verified_at` NULL and sends a code; `POST /api/verify` with `{code}` confirms the email and logs in, and `POST /api/verify/resend` sends a new code with fresh guesses. Unconfirmed accounts cannot log in and are not listed or invitable.
+- Registering an email that is still unconfirmed replaces that account; unconfirmed accounts without a working code are deleted on the next registration, freeing their username.
 - Login uses email and password. Usernames are only display names, unique case-insensitively.
-- `POST /api/forgot` always answers 204 so it does not reveal which emails exist, and emails a `/reset?token=…` link (1 hour). `POST /api/reset` sets the password, confirms the email, deletes all of the user's sessions, and logs in.
-- Email tokens live in `email_tokens`, are single use (deleted when used), and are checked against their `purpose`.
+- `POST /api/forgot` always answers 204 and sets the `reset` cookie, so it does not reveal which emails exist; for an unknown email the cookie leads to no code. Asking again replaces the code. `POST /api/reset` with `{code, password}` sets the password, confirms the email, deletes all of the user's sessions, and logs in. Its errors never say how many guesses are left, which would reveal that the account exists.
 - Each address gets at most one email per minute and five per hour (`rate_limit_email`, table `email_sends`). Requests count even for unknown addresses, so a 429 from `/api/forgot` does not reveal whether an account exists. Tests that send two emails to one address within a minute call `Server::age_email_sends` in between.
 - Emailed links are built from `SET_BASE_URL`, never from the request's Host header, which a client can forge.
 
@@ -36,6 +36,6 @@ The project has no production data yet. Change the schema by editing `server/mig
 
 ## Tests
 
-- Integration tests start a real server on a random port with a fresh database file and `Mailer::Memory`, and read confirmation codes and reset links from the in-memory outbox (`Server::code`, `Server::link_token`). `Server::register` registers and confirms a user in one step.
+- Integration tests start a real server on a random port with a fresh database file and `Mailer::Memory`, and read codes from the in-memory outbox (`Server::code`). `Server::register` registers and confirms a user in one step.
 - Test behavior through the HTTP API and WebSocket messages, as the existing tests do.
 - UI changes have no automated tests: build the frontend, run the server, and check the pages in a browser.

@@ -15,22 +15,17 @@ CREATE TABLE sessions (
     created_at INTEGER NOT NULL
 );
 
--- Single-use tokens sent by email: 'reset' sets a new password.
-CREATE TABLE email_tokens (
+-- Codes sent by email and entered in the browser that asked for them: 'verify' confirms the
+-- address after registering, 'reset' sets a new password. `token` is the secret in that browser's
+-- cookie named after the purpose, so an intercepted code is useless. `attempts` counts guesses.
+CREATE TABLE email_codes (
     token TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    purpose TEXT NOT NULL CHECK (purpose IN ('reset')),
-    expires_at INTEGER NOT NULL
-);
-
--- Confirmation codes waiting to be entered. `token` is the secret in the registering browser's
--- `verify` cookie, so the emailed code works only in that browser. `attempts` counts guesses.
-CREATE TABLE verifications (
-    token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    purpose TEXT NOT NULL CHECK (purpose IN ('verify', 'reset')),
     code TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
-    expires_at INTEGER NOT NULL
+    expires_at INTEGER NOT NULL,
+    UNIQUE (user_id, purpose)
 );
 
 -- Recent requests to email each address, for the rate limit. Rows older than an hour are deleted.

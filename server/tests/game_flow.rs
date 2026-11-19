@@ -61,16 +61,7 @@ impl Server {
         http.post(format!("http://{}{path}", self.base)).json(&body).send().await.unwrap()
     }
 
-    /// The token in the link of the last email sent to `to` that leads to `path`.
-    fn link_token(&self, to: &str, path: &str) -> String {
-        let outbox = self.outbox.lock().unwrap();
-        let mail = outbox.iter().rev().find(|m| m.to == to).unwrap_or_else(|| panic!("no email to {to}"));
-        let prefix = format!("http://set.test{path}?token=");
-        let start = mail.body.find(&prefix).unwrap_or_else(|| panic!("no {path} link in {mail:?}")) + prefix.len();
-        mail.body[start..].split_whitespace().next().unwrap().to_owned()
-    }
-
-    /// The confirmation code in the last email sent to `to`.
+    /// The code in the last email sent to `to`.
     fn code(&self, to: &str) -> String {
         let outbox = self.outbox.lock().unwrap();
         let mail = outbox.iter().rev().find(|m| m.to == to).unwrap_or_else(|| panic!("no email to {to}"));
@@ -229,30 +220,73 @@ async fn password_reset() {
     let server = start_server().await;
     let alice = server.register("alice").await;
     server.age_email_sends(61).await;
-    let http = reqwest::Client::new();
+    let http = browser();
     let login = |password: &str| server.post(&http, "/api/login", json!({ "email": "alice@example.com", "password": password }));
+    let reset = |code: &str, password: &str| server.post(&http, "/api/reset", json!({ "code": code, "password": password }));
 
-    // Unknown emails get the same answer and no email.
+    // Unknown emails get the same answer, cookie included, and no email; any code is then wrong,
+    // with the same message as a wrong code for a real account.
     let sent = server.outbox.lock().unwrap().len();
-    assert_eq!(server.post(&http, "/api/forgot", json!({ "email": "nobody@example.com" })).await.status(), 204);
+    let resp = server.post(&http, "/api/forgot", json!({ "email": "nobody@example.com" })).await;
+    assert_eq!(resp.status(), 204);
+    assert!(resp.headers().get("set-cookie").is_some());
     assert_eq!(server.outbox.lock().unwrap().len(), sent);
+    let unknown = reset("123456", "newsecret").await;
+    assert_eq!(unknown.status(), 400);
+    let unknown = unknown.text().await.unwrap();
 
     assert_eq!(server.post(&http, "/api/forgot", json!({ "email": "Alice@example.com" })).await.status(), 204);
-    let token = server.link_token("alice@example.com", "/reset");
-    // A too short password leaves the token usable.
-    let short = server.post(&http, "/api/reset", json!({ "token": token, "password": "short" })).await;
-    assert_eq!(short.status(), 400);
-    let resp = server.post(&http, "/api/reset", json!({ "token": token, "password": "newsecret" })).await;
+    let code = server.code("alice@example.com");
+    let wrong = format!("{:06}", (code.parse::<u32>().unwrap() + 1) % 1_000_000);
+    assert_eq!(reset(&wrong, "newsecret").await.text().await.unwrap(), unknown, "wrong codes do not reveal the account");
+
+    // The code works only in the browser that asked for it.
+    let other = server.post(&browser(), "/api/reset", json!({ "code": code, "password": "hacked1" })).await;
+    assert_eq!(other.status(), 400);
+
+    // A too short password leaves the code usable.
+    assert_eq!(reset(&code, "short").await.status(), 400);
+    let resp = reset(&code, "newsecret").await;
     assert_eq!(resp.status(), 200);
-    assert!(resp.headers().get("set-cookie").is_some(), "a reset logs in");
+    assert!(session_cookie(&resp).is_some(), "a reset logs in");
 
     // The reset logs out the old session, and only the new password works.
     let resp = alice.http.get(format!("http://{}/api/me", server.base)).send().await.unwrap();
     assert_eq!(resp.status(), 401);
     assert_eq!(login("secret1").await.status(), 401);
     assert_eq!(login("newsecret").await.status(), 200);
-    let again = server.post(&http, "/api/reset", json!({ "token": token, "password": "another1" })).await;
-    assert_eq!(again.status(), 400, "reset links are single-use");
+    assert_eq!(reset(&code, "another1").await.status(), 400, "reset codes are single-use");
+}
+
+#[tokio::test]
+async fn resend_confirmation_code() {
+    let server = start_server().await;
+    let http = browser();
+    let verify = |code: &str| server.post(&http, "/api/verify", json!({ "code": code }));
+    let resend = || server.post(&http, "/api/verify/resend", json!({}));
+
+    // Only a browser with a pending registration can ask for a new code.
+    assert_eq!(server.post(&browser(), "/api/verify/resend", json!({})).await.status(), 400);
+    let resp = server.post(&http, "/api/register", json!({ "email": "bob@example.com", "username": "bob", "password": "secret1" })).await;
+    assert_eq!(resp.status(), 204);
+    let first = server.code("bob@example.com");
+    assert_eq!(resend().await.status(), 429, "one email per minute");
+
+    // Use up the code's guesses; a new code brings new ones and replaces the old code.
+    let wrong = format!("{:06}", (first.parse::<u32>().unwrap() + 1) % 1_000_000);
+    for _ in 0..5 {
+        assert_eq!(verify(&wrong).await.status(), 400);
+    }
+    server.age_email_sends(61).await;
+    assert_eq!(resend().await.status(), 204);
+    let second = server.code("bob@example.com");
+    if first != second {
+        assert_eq!(verify(&first).await.status(), 400);
+    }
+    let resp = verify(&second).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.json::<Value>().await.unwrap()["username"], "bob");
+    assert_eq!(resend().await.status(), 400, "nothing to resend once confirmed");
 }
 
 #[tokio::test]
