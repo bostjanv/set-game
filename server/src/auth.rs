@@ -34,9 +34,11 @@ pub fn clear_cookie() -> String {
 }
 
 /// The cookie named after an email code's purpose (`verify` or `reset`). It holds the secret
-/// of the browser that asked for the code, so only that browser can enter it.
+/// of the browser that asked for the code, so only that browser can enter it. It has no `Path`,
+/// so the browser scopes it to the directory of the request that set it: `/api` at the root, or
+/// `/set-game/api` behind a reverse proxy that serves the app under `/set-game`.
 pub fn code_cookie(purpose: &str, token: &str, max_age: i64) -> String {
-    format!("{purpose}={token}; Path=/api; HttpOnly; SameSite=Strict; Max-Age={max_age}")
+    format!("{purpose}={token}; HttpOnly; SameSite=Strict; Max-Age={max_age}")
 }
 
 pub fn session_token(headers: &HeaderMap) -> Option<String> {
