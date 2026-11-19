@@ -31,7 +31,12 @@ A multiplayer SET card game. The Rust server (`server/`: axum, sqlx with SQLite)
 
 ## Database
 
-The project has no production data yet. Change the schema by editing `server/migrations/0001_init.sql` directly rather than adding migrations, and delete the local database (`set.db`, `set.db-wal`, `set.db-shm`) afterwards: sqlx refuses to start with `VersionMismatch(1)` when an applied migration has changed. Once there is data to keep, add new numbered migrations instead.
+`db::open` runs the migrations in `server/migrations/` (embedded with `sqlx::migrate!`) at startup.
+
+- Never edit a migration that has been applied, including `0001_init.sql`: sqlx stores each one's checksum and refuses to start with `VersionMismatch(n)` when it changes. Change the schema with a new file, `0002_<what>.sql`, `0003_…`. Migrations only go forward; undo a change with another migration.
+- SQLite's `ALTER TABLE` only adds, renames, and drops plain columns. For other changes, rebuild the table: create `new_x`, copy the rows, `DROP TABLE x`, rename `new_x` to `x`, and recreate its indexes.
+- `db::open` runs the migrations on their own connection with foreign keys off, so a migration can rebuild a table that other tables reference (such as `users` or `games`); with them on, `DROP TABLE` would delete every row first, run the `ON DELETE CASCADE` deletes, and fail the checks. Migrations cannot change `PRAGMA foreign_keys` themselves, because sqlx 0.8 runs every SQLite migration in a transaction (ignoring `-- no-transaction`). Afterwards `db::open` runs `pragma_foreign_key_check` and refuses to start if a reference is broken; fix that with a new migration that repairs the data.
+- `migrations_keep_existing_data` in `server/tests/game_flow.rs` seeds a database built from `0001_init.sql` alone, runs every migration, and checks the data through the API. When a migration reshapes the seeded tables, extend its checks.
 
 ## Tests
 

@@ -17,12 +17,22 @@ struct Server {
 }
 
 async fn start_server() -> Server {
+    start_server_on(&fresh_db_path()).await
+}
+
+/// A path for a database file that does not exist yet.
+fn fresh_db_path() -> String {
     let path = std::env::temp_dir().join(format!("set-test-{}-{}.db", std::process::id(), rand_suffix()));
+    let path = path.to_str().unwrap().to_owned();
     for ext in ["", "-wal", "-shm"] {
-        std::fs::remove_file(format!("{}{ext}", path.display())).ok();
+        std::fs::remove_file(format!("{path}{ext}")).ok();
     }
+    path
+}
+
+async fn start_server_on(path: &str) -> Server {
     let outbox = Arc::new(Mutex::new(Vec::new()));
-    let state = set_server::setup(path.to_str().unwrap(), Mailer::Memory(outbox.clone())).await.unwrap();
+    let state = set_server::setup(path, Mailer::Memory(outbox.clone())).await.unwrap();
     let db = state.db.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -480,4 +490,45 @@ async fn leader_leaving_cancels_waiting_game() {
     a.send(json!({ "type": "leave_game" })).await;
     b.until(|v| v["type"] == "game" && v["game"].is_null()).await;
     assert_eq!(b.until_type("notice").await["message"], "The leader closed the game");
+}
+
+/// A database written by the first release keeps working after every later migration. The seed
+/// below is written against 0001_init.sql, which never changes once deployed, so this test stays
+/// valid as migrations are added; extend the checks when a migration reshapes these tables.
+#[tokio::test]
+async fn migrations_keep_existing_data() {
+    let path = fresh_db_path();
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true).foreign_keys(true);
+    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+    let mut baseline = sqlx::migrate!("./migrations");
+    baseline.migrations = baseline.migrations.iter().filter(|m| m.version == 1).cloned().collect::<Vec<_>>().into();
+    baseline.run(&pool).await.unwrap();
+    let hash = set_server::auth::hash_password("secret1");
+    sqlx::raw_sql(&format!(
+        "INSERT INTO users (id, email, username, password_hash, email_verified_at, created_at) VALUES
+             (1, 'alice@example.com', 'alice', '{hash}', 1700000000, 1700000000),
+             (2, 'bob@example.com', 'bob', '{hash}', 1700000000, 1700000000);
+         INSERT INTO sessions (token, user_id, created_at) VALUES ('old-session', 2, 1700000000);
+         INSERT INTO games (id, started_at, finished_at) VALUES (1, 1700000100, 1700000400);
+         INSERT INTO game_players (game_id, user_id, sets, won) VALUES (1, 1, 14, 1), (1, 2, 9, 0);"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let server = start_server_on(&path).await;
+    let http = browser();
+    let resp = server.post(&http, "/api/login", json!({ "email": "alice@example.com", "password": "secret1" })).await;
+    assert_eq!(resp.status(), 200, "existing accounts can still log in");
+    let alice = User { cookie: session_cookie(&resp).unwrap(), http, id: 1 };
+    let bob = User { http: browser(), cookie: "sid=old-session".into(), id: 2 };
+    let resp = bob.http.get(format!("http://{}/api/me", server.base)).header("cookie", &bob.cookie).send().await.unwrap();
+    let me: Value = resp.json().await.unwrap();
+    assert_eq!(me, json!({ "id": bob.id, "username": "bob", "email": "bob@example.com", "played": 1, "wins": 0 }), "sessions survive");
+    assert_eq!(server.get(&alice, "/api/leaderboard").await, json!([
+        { "username": "alice", "played": 1, "wins": 1 },
+        { "username": "bob", "played": 1, "wins": 0 },
+    ]));
+    assert_eq!(server.register("carol").await.id, 3, "new rows continue after the old ones");
 }

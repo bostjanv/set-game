@@ -1,7 +1,8 @@
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::Connection;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -15,9 +16,25 @@ pub async fn open(path: &str) -> Result<SqlitePool, Error> {
         .create_if_missing(true)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal);
-    let pool = SqlitePoolOptions::new().max_connections(5).connect_with(opts).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    Ok(pool)
+    migrate(opts.clone().foreign_keys(false)).await?;
+    Ok(SqlitePoolOptions::new().max_connections(5).connect_with(opts).await?)
+}
+
+/// Runs the migrations on a connection without foreign keys, so a migration can rebuild a table
+/// that others reference: with them on, `DROP TABLE` would cascade and fail the checks. sqlx runs
+/// each migration in a transaction, where `PRAGMA foreign_keys` cannot be changed, hence the
+/// separate connection. Afterwards every reference must still hold.
+async fn migrate(opts: SqliteConnectOptions) -> Result<(), Error> {
+    let mut conn = SqliteConnection::connect_with(&opts).await?;
+    sqlx::migrate!("./migrations").run(&mut conn).await?;
+    let broken: Vec<String> = sqlx::query_scalar(r#"SELECT DISTINCT "table" FROM pragma_foreign_key_check"#)
+        .fetch_all(&mut conn)
+        .await?;
+    conn.close().await?;
+    if !broken.is_empty() {
+        return Err(format!("migrations left broken foreign keys in tables: {}", broken.join(", ")).into());
+    }
+    Ok(())
 }
 
 pub fn random_token() -> String {
