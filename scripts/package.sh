@@ -75,7 +75,6 @@ Put single quotes around a value that contains spaces or any of < > & ? ;
 To set several, list them all before the command. A backslash at the end of a
 line continues the command on the next line:
 
-  SET_BASE_URL=https://set.example.com \
   SET_SMTP_URL='smtps://set%40example.com:secret@smtp.example.com' \
   SET_MAIL_FROM='SET <set@example.com>' \
   ./set-server
@@ -97,13 +96,6 @@ SET_ADDR
   machines; 127.0.0.1 only from this one, such as behind a reverse proxy.
   Default: 0.0.0.0:8080
   Example: SET_ADDR=127.0.0.1:3000
-
-SET_BASE_URL
-  The address players use to open the site. Links in emails (account
-  confirmation, password reset) start with it, so set it whenever the site is
-  not opened at http://localhost:8080.
-  Default: http://localhost:8080
-  Example: SET_BASE_URL=https://set.example.com
 
 SET_SMTP_URL
   The mail server for sending emails, with its user name and password. When
@@ -143,7 +135,6 @@ service. The commands below need root.
      ExecStart=/opt/set-game/set-server
      Environment=SET_STATIC=/opt/set-game/web/dist
      Environment=SET_DB=/var/lib/set-game/set.db
-     Environment=SET_BASE_URL=https://set.example.com
      EnvironmentFile=-/etc/set-game.env
      DynamicUser=yes
      StateDirectory=set-game

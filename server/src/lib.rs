@@ -19,12 +19,10 @@ pub struct AppState {
     pub db: SqlitePool,
     pub hub: Arc<Mutex<hub::Hub>>,
     pub mailer: mail::Mailer,
-    /// Public URL of the site without a trailing slash, for links in emails.
-    pub base_url: String,
 }
 
 /// Opens the database and starts the background sweeper for idle games.
-pub async fn setup(db_path: &str, mailer: mail::Mailer, base_url: &str) -> Result<AppState, db::Error> {
+pub async fn setup(db_path: &str, mailer: mail::Mailer) -> Result<AppState, db::Error> {
     let db = db::open(db_path).await?;
     let hub = Arc::new(Mutex::new(hub::Hub::new(db.clone())));
     let sweeper = Arc::downgrade(&hub);
@@ -36,7 +34,7 @@ pub async fn setup(db_path: &str, mailer: mail::Mailer, base_url: &str) -> Resul
             hub.lock().unwrap().sweep();
         }
     });
-    Ok(AppState { db, hub, mailer, base_url: base_url.trim_end_matches('/').to_owned() })
+    Ok(AppState { db, hub, mailer })
 }
 
 /// The API and WebSocket routes, plus the built frontend in `static_dir` when given.

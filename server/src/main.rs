@@ -11,13 +11,12 @@ async fn main() -> Result<(), db::Error> {
     let db_path = std::env::var("SET_DB").unwrap_or_else(|_| "set.db".into());
     let static_dir = PathBuf::from(std::env::var("SET_STATIC").unwrap_or_else(|_| "web/dist".into()));
     let addr = std::env::var("SET_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let base_url = std::env::var("SET_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".into());
     let mailer = mail::Mailer::from_env()?;
     if matches!(mailer, mail::Mailer::Log) {
         tracing::warn!("SET_SMTP_URL is not set: emails are written to this log instead of being sent");
     }
 
-    let state = setup(&db_path, mailer, &base_url).await?;
+    let state = setup(&db_path, mailer).await?;
     if !static_dir.join("index.html").exists() {
         tracing::warn!("{} has no index.html; only the API is served", static_dir.display());
     }

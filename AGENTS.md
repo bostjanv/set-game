@@ -7,7 +7,7 @@ A multiplayer SET card game. The Rust server (`server/`: axum, sqlx with SQLite)
 - Server tests: `cd server && cargo test` (unit tests for the rules, integration tests in `server/tests/game_flow.rs`).
 - Frontend type-check and build: `cd web && npm run build` (runs `tsc --noEmit`, then Vite into `web/dist`).
 - Run: build the frontend, then `cargo run --release --manifest-path server/Cargo.toml` from the repository root; it serves http://localhost:8080.
-- Frontend development: also run `npm run dev` in `web/` (Vite on :5173 proxies `/api` and `/ws` to :8080). Start the server with `SET_BASE_URL=http://localhost:5173` so emailed links open the dev server.
+- Frontend development: also run `npm run dev` in `web/` (Vite on :5173 proxies `/api` and `/ws` to :8080).
 - CI (`.github/workflows/ci.yml`) runs `cargo test --locked`, `npm run build`, and `docker build`. Commit `server/Cargo.lock` with dependency changes.
 
 ## Layout
@@ -28,7 +28,6 @@ A multiplayer SET card game. The Rust server (`server/`: axum, sqlx with SQLite)
 - Login uses email and password. Usernames are only display names, unique case-insensitively.
 - `POST /api/forgot` always answers 204 and sets the `reset` cookie, so it does not reveal which emails exist; for an unknown email the cookie leads to no code. Asking again replaces the code. `POST /api/reset` with `{code, password}` sets the password, confirms the email, deletes all of the user's sessions, and logs in. Its errors never say how many guesses are left, which would reveal that the account exists.
 - Each address gets at most one email per minute and five per hour (`rate_limit_email`, table `email_sends`). Requests count even for unknown addresses, so a 429 from `/api/forgot` does not reveal whether an account exists. Tests that send two emails to one address within a minute call `Server::age_email_sends` in between.
-- Emailed links are built from `SET_BASE_URL`, never from the request's Host header, which a client can forge.
 
 ## Database
 

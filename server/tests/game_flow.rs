@@ -22,7 +22,7 @@ async fn start_server() -> Server {
         std::fs::remove_file(format!("{}{ext}", path.display())).ok();
     }
     let outbox = Arc::new(Mutex::new(Vec::new()));
-    let state = set_server::setup(path.to_str().unwrap(), Mailer::Memory(outbox.clone()), "http://set.test/").await.unwrap();
+    let state = set_server::setup(path.to_str().unwrap(), Mailer::Memory(outbox.clone())).await.unwrap();
     let db = state.db.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());

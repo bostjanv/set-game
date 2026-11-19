@@ -17,7 +17,7 @@ docker build -t set-game .
 docker run -p 8080:8080 -v set-data:/data set-game
 ```
 
-Open http://localhost:8080 and register. Without SMTP settings the confirmation code appears in the container log. To send real email, pass `-e SET_SMTP_URL=… -e SET_MAIL_FROM=… -e SET_BASE_URL=https://your.site`.
+Open http://localhost:8080 and register. Without SMTP settings the confirmation code appears in the container log. To send real email, pass `-e SET_SMTP_URL=… -e SET_MAIL_FROM=…`.
 
 ## Release archives
 
@@ -47,13 +47,12 @@ For frontend work, run `npm run dev` in `web/` as well: Vite serves on :5173 and
 | `SET_DB` | `set.db` | SQLite database file |
 | `SET_STATIC` | `web/dist` | Built frontend to serve |
 | `SET_ADDR` | `0.0.0.0:8080` | Listen address |
-| `SET_BASE_URL` | `http://localhost:8080` | Public URL used in emailed links |
 | `SET_SMTP_URL` | unset | SMTP server, such as `smtps://user:password@smtp.example.com` (port 465) or `smtp://user:password@smtp.example.com:587?tls=required`. When unset, emails are written to the server log |
 | `SET_MAIL_FROM` | unset | Sender, such as `SET <set@example.com>`; required with `SET_SMTP_URL` |
 
 ### Behind a reverse proxy under a path prefix
 
-The frontend works out its path prefix from where its script was loaded, so the same build runs at `/` or under a prefix such as `/set-game`. Have the proxy strip the prefix and forward WebSocket upgrades, and include the prefix in `SET_BASE_URL` (`https://your.site/set-game`) so emailed links open under it. With nginx:
+The frontend works out its path prefix from where its script was loaded, so the same build runs at `/` or under a prefix such as `/set-game`. Have the proxy strip the prefix and forward WebSocket upgrades. With nginx:
 
 ```nginx
 location /set-game/ {
