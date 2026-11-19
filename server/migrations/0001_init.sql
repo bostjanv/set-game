@@ -1,4 +1,4 @@
--- email_verified_at is NULL until the user follows the confirmation link; unverified
+-- email_verified_at is NULL until the user enters the emailed confirmation code; unverified
 -- users cannot log in and are replaced when someone registers the same email again.
 CREATE TABLE users (
     id INTEGER PRIMARY KEY,
@@ -15,11 +15,21 @@ CREATE TABLE sessions (
     created_at INTEGER NOT NULL
 );
 
--- Single-use tokens sent by email: 'verify' confirms the address, 'reset' sets a new password.
+-- Single-use tokens sent by email: 'reset' sets a new password.
 CREATE TABLE email_tokens (
     token TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    purpose TEXT NOT NULL CHECK (purpose IN ('verify', 'reset')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('reset')),
+    expires_at INTEGER NOT NULL
+);
+
+-- Confirmation codes waiting to be entered. `token` is the secret in the registering browser's
+-- `verify` cookie, so the emailed code works only in that browser. `attempts` counts guesses.
+CREATE TABLE verifications (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+    code TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
     expires_at INTEGER NOT NULL
 );
 

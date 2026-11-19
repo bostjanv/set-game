@@ -38,13 +38,10 @@ function link(path: string, label: string) {
 }
 
 async function boot() {
-  // A confirmation link logs in as its account, replacing any current session.
-  if (appPath() !== '/verify') {
-    try {
-      state.me = await api<Me>('GET', '/api/me');
-    } catch (e) {
-      if (!(e instanceof ApiError && e.status === 401)) throw e;
-    }
+  try {
+    state.me = await api<Me>('GET', '/api/me');
+  } catch (e) {
+    if (!(e instanceof ApiError && e.status === 401)) throw e;
   }
   if (state.me) startSession();
   render();
@@ -287,14 +284,9 @@ function registerForm() {
       field('Password', 'password', 'password', 'new-password'),
     ],
     'Register',
-    async (d, el) => {
+    async (d) => {
       await api('POST', '/api/register', { email: d.get('email'), username: d.get('username'), password: d.get('password') });
-      el.replaceWith(
-        notice(
-          'Check your email',
-          `We sent a confirmation link to ${d.get('email')}. Follow it within 24 hours to finish creating your account.`,
-        ),
-      );
+      navigate(`/verify?email=${encodeURIComponent(String(d.get('email')))}`);
     },
     h('p', { class: 'hint' }, 'Already registered? ', link('/', 'Log in')),
   );
@@ -328,24 +320,27 @@ function resetForm() {
   );
 }
 
-/** Confirms the email from the link in the confirmation email, which logs in. */
+/** Confirms the email with the emailed code, which logs in. Works only in the browser that registered. */
 function verifyPage() {
-  const el = notice('Confirming your email…', '');
-  (async () => {
-    try {
-      await loggedIn(await api('POST', '/api/verify', { token: tokenParam() }));
+  const email = new URLSearchParams(location.search).get('email');
+  return form(
+    'Check your email',
+    [
+      h('p', {}, `We sent a 6-digit code to ${email ?? 'your email'}. Enter it here within 30 minutes to finish creating your account.`),
+      h(
+        'label',
+        {},
+        'Confirmation code',
+        h('input', { name: 'code', required: true, inputmode: 'numeric', pattern: '\\d{6}', maxlength: 6, autocomplete: 'one-time-code' }),
+      ),
+    ],
+    'Confirm',
+    async (d) => {
+      await loggedIn(await api('POST', '/api/verify', { code: d.get('code') }));
       toast('Email confirmed. Welcome!', 'success');
-    } catch (err) {
-      el.replaceWith(
-        notice(
-          'This link does not work',
-          `${err instanceof Error ? err.message : err}. If your account is confirmed already, log in; otherwise register again to get a new link.`,
-          h('p', { class: 'hint' }, link('/', 'Log in'), ' · ', link('/register', 'Register')),
-        ),
-      );
-    }
-  })();
-  return el;
+    },
+    h('p', { class: 'hint' }, 'No code, or it expired? ', link('/register', 'Register again')),
+  );
 }
 
 async function logout(go = true) {

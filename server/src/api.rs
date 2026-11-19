@@ -48,7 +48,10 @@ pub fn routes() -> Router<AppState> {
         .route("/ws", get(ws::handler))
 }
 
-const VERIFY_TTL: i64 = 24 * 3600;
+/// How long a confirmation code works; unconfirmed accounts older than this are deleted.
+const VERIFY_TTL: i64 = 30 * 60;
+/// Wrong guesses allowed per confirmation code, so it cannot be brute-forced.
+const VERIFY_ATTEMPTS: i64 = 5;
 const RESET_TTL: i64 = 3600;
 
 #[derive(Deserialize)]
@@ -72,9 +75,12 @@ struct EmailOnly {
 #[derive(Deserialize)]
 struct TokenBody {
     token: String,
-    /// The new password, for `reset`.
-    #[serde(default)]
     password: String,
+}
+
+#[derive(Deserialize)]
+struct CodeBody {
+    code: String,
 }
 
 fn check_password(password: &str) -> ApiResult<()> {
@@ -159,9 +165,10 @@ async fn send_mail(state: &AppState, to: &str, subject: &str, body: String) -> A
     })
 }
 
-/// Creates an unverified account and emails its confirmation link; the account can log in
-/// after following the link. Registering an email that is not confirmed yet replaces that account.
-async fn register(State(state): State<AppState>, Json(body): Json<Registration>) -> ApiResult<StatusCode> {
+/// Creates an unverified account and emails its confirmation code; the account can log in
+/// once the code is entered in this browser, which gets the `verify` cookie.
+/// Registering an email that is not confirmed yet replaces that account.
+async fn register(State(state): State<AppState>, Json(body): Json<Registration>) -> ApiResult<impl IntoResponse> {
     let email = body.email.trim().to_owned();
     if email.parse::<lettre::Address>().is_err() {
         return Err(bad_request("Enter a valid email address"));
@@ -205,28 +212,60 @@ async fn register(State(state): State<AppState>, Json(body): Json<Registration>)
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
+    let token = db::random_token();
+    let code = format!("{:06}", rand::Rng::gen_range(&mut rand::thread_rng(), 0..1_000_000));
+    sqlx::query("INSERT INTO verifications (token, user_id, code, expires_at) VALUES (?, ?, ?, ?)")
+        .bind(&token)
+        .bind(user_id)
+        .bind(&code)
+        .bind(now() + VERIFY_TTL)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
 
-    let token = create_token(&state.db, user_id, "verify", VERIFY_TTL).await?;
-    let link = format!("{}/verify?token={token}", state.base_url);
     let body = format!(
-        "Hi {username},\n\nConfirm your email address to finish creating your SET account:\n\n{link}\n\n\
-         The link expires in 24 hours. If you did not register, ignore this email.\n"
+        "Hi {username},\n\nYour SET confirmation code is:\n\n{code}\n\n\
+         Enter it on the page where you registered. It expires in 30 minutes.\n\
+         If you did not register, ignore this email.\n"
     );
-    send_mail(&state, &email, "Confirm your SET account", body).await?;
-    Ok(StatusCode::NO_CONTENT)
+    send_mail(&state, &email, "Your SET confirmation code", body).await?;
+    Ok((AppendHeaders([(SET_COOKIE, auth::verify_cookie(&token, VERIFY_TTL))]), StatusCode::NO_CONTENT))
 }
 
-/// Confirms the email of the token's account and logs it in.
-async fn verify(State(state): State<AppState>, Json(body): Json<TokenBody>) -> ApiResult<impl IntoResponse> {
-    let user_id = take_token(&state.db, &body.token, "verify").await?;
-    let username: String =
-        sqlx::query_scalar("UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ? RETURNING username")
-            .bind(now())
-            .bind(user_id)
-            .fetch_one(&state.db)
-            .await?;
-    start_session(&state, user_id, username).await
+/// Confirms the email of the account this browser registered when `code` is the emailed one,
+/// and logs it in. Without the `verify` cookie the code is useless, so intercepting it is not enough.
+async fn verify(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<CodeBody>) -> ApiResult<impl IntoResponse> {
+    let expired = || bad_request("This code has expired. Register again to get a new one.");
+    let token = auth::cookie(&headers, auth::VERIFY_COOKIE)
+        .ok_or_else(|| bad_request("Enter the code in the browser where you registered, or register again here."))?;
+    // Counts the guess before comparing, so concurrent guesses cannot exceed the limit.
+    let (code, attempts): (String, i64) = sqlx::query_as(
+        "UPDATE verifications SET attempts = attempts + 1 WHERE token = ? AND expires_at > ? AND attempts < ? RETURNING code, attempts",
+    )
+    .bind(&token)
+    .bind(now())
+    .bind(VERIFY_ATTEMPTS)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(expired)?;
+    if body.code.trim() != code {
+        let left = VERIFY_ATTEMPTS - attempts;
+        return Err(if left == 0 { expired() } else { bad_request(&format!("Wrong code. {left} attempts left.")) });
+    }
+    let mut tx = state.db.begin().await?;
+    // Deleting claims the code, so it confirms and logs in only once.
+    let user_id: i64 = sqlx::query_scalar("DELETE FROM verifications WHERE token = ? RETURNING user_id")
+        .bind(&token)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(expired)?;
+    let username: String = sqlx::query_scalar("UPDATE users SET email_verified_at = ? WHERE id = ? RETURNING username")
+        .bind(now())
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((AppendHeaders([(SET_COOKIE, auth::verify_cookie("", 0))]), start_session(&state, user_id, username).await?))
 }
 
 async fn login(State(state): State<AppState>, Json(body): Json<Login>) -> ApiResult<impl IntoResponse> {
@@ -245,7 +284,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<Login>) -> ApiRes
     if verified_at.is_none() {
         return Err(ApiError(
             StatusCode::FORBIDDEN,
-            "Confirm your email first with the link we sent you, or register again to get a new link".into(),
+            "Confirm your email first with the code we sent you, or register again to get a new code".into(),
         ));
     }
     start_session(&state, id, username).await

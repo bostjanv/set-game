@@ -36,6 +36,20 @@ fn rand_suffix() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// An HTTP client that keeps cookies, like a browser.
+fn browser() -> reqwest::Client {
+    reqwest::Client::builder().cookie_store(true).build().unwrap()
+}
+
+/// The `sid=…` session cookie the response sets, if any.
+fn session_cookie(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().split(';').next().unwrap().to_owned())
+        .find(|c| c.starts_with("sid="))
+}
+
 struct User {
     http: reqwest::Client,
     cookie: String,
@@ -56,15 +70,23 @@ impl Server {
         mail.body[start..].split_whitespace().next().unwrap().to_owned()
     }
 
+    /// The confirmation code in the last email sent to `to`.
+    fn code(&self, to: &str) -> String {
+        let outbox = self.outbox.lock().unwrap();
+        let mail = outbox.iter().rev().find(|m| m.to == to).unwrap_or_else(|| panic!("no email to {to}"));
+        let code = mail.body.split_whitespace().find(|w| w.len() == 6 && w.chars().all(|c| c.is_ascii_digit()));
+        code.unwrap_or_else(|| panic!("no code in {mail:?}")).to_owned()
+    }
+
     /// Registers `name` with the email `name@example.com` and confirms it, which logs in.
     async fn register(&self, name: &str) -> User {
-        let http = reqwest::Client::builder().cookie_store(true).build().unwrap();
+        let http = browser();
         let email = format!("{name}@example.com");
         let resp = self.post(&http, "/api/register", json!({ "email": email, "username": name, "password": "secret1" })).await;
         assert_eq!(resp.status(), 204, "register {name}");
-        let resp = self.post(&http, "/api/verify", json!({ "token": self.link_token(&email, "/verify") })).await;
+        let resp = self.post(&http, "/api/verify", json!({ "code": self.code(&email) })).await;
         assert_eq!(resp.status(), 200, "verify {name}");
-        let cookie = resp.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_owned();
+        let cookie = session_cookie(&resp).expect("verify logs in");
         let body: Value = resp.json().await.unwrap();
         User { http, cookie, id: body["id"].as_i64().unwrap() }
     }
@@ -140,37 +162,58 @@ fn score(game: &Value, id: i64) -> u64 {
 async fn email_registration() {
     let server = start_server().await;
     let http = reqwest::Client::new();
+    let alice_browser = browser();
     let register = |email: &str, name: &str| {
-        server.post(&http, "/api/register", json!({ "email": email, "username": name, "password": "secret1" }))
+        server.post(&alice_browser, "/api/register", json!({ "email": email, "username": name, "password": "secret1" }))
     };
+    let verify = |code: &str| server.post(&alice_browser, "/api/verify", json!({ "code": code }));
     let login = |email: &str, password: &str| server.post(&http, "/api/login", json!({ "email": email, "password": password }));
 
     assert_eq!(register("not-an-email", "alice").await.status(), 400);
     let resp = register("alice@example.com", "alice").await;
     assert_eq!(resp.status(), 204);
-    assert!(resp.headers().get("set-cookie").is_none(), "no session before the email is confirmed");
-    let first = server.link_token("alice@example.com", "/verify");
+    assert!(session_cookie(&resp).is_none(), "no session before the email is confirmed");
+    let first = server.code("alice@example.com");
 
     // Unconfirmed accounts cannot log in; a wrong password still reads as a wrong password.
     assert_eq!(login("alice@example.com", "secret1").await.status(), 403);
     assert_eq!(login("alice@example.com", "wrong!!").await.status(), 401);
 
-    // Registering the unconfirmed email again replaces the account, and only the new link works.
+    // The code works only in the browser that registered, so intercepting the email is not enough.
+    let resp = server.post(&http, "/api/verify", json!({ "code": first })).await;
+    assert_eq!(resp.status(), 400);
+    assert!(session_cookie(&resp).is_none());
+
+    // Registering the unconfirmed email again replaces the account, and only the new code works.
     server.age_email_sends(61).await;
     assert_eq!(register("ALICE@example.com", "alice2").await.status(), 204);
-    let resp = server.post(&http, "/api/verify", json!({ "token": first })).await;
-    assert_eq!(resp.status(), 400);
-    let alice = server.post(&http, "/api/verify", json!({ "token": server.link_token("ALICE@example.com", "/verify") })).await;
+    let second = server.code("ALICE@example.com");
+    if first != second {
+        assert_eq!(verify(&first).await.status(), 400);
+    }
+    let alice = verify(&second).await;
     assert_eq!(alice.status(), 200);
     assert_eq!(alice.json::<Value>().await.unwrap()["username"], "alice2");
+    assert_eq!(verify(&second).await.status(), 400, "codes are single-use");
     assert_eq!(login("alice@example.com", "secret1").await.status(), 200);
 
     // A confirmed email or username cannot be taken again.
     assert_eq!(register("Alice@Example.com", "someone").await.status(), 409);
     assert_eq!(register("other@example.com", "ALICE2").await.status(), 409);
 
+    // Five wrong guesses use up the code, so it cannot be brute-forced.
+    let bob = browser();
+    let resp = server.post(&bob, "/api/register", json!({ "email": "bob@example.com", "username": "bob", "password": "secret1" })).await;
+    assert_eq!(resp.status(), 204);
+    let code: u32 = server.code("bob@example.com").parse().unwrap();
+    for i in 1..=5 {
+        let wrong = format!("{:06}", (code + i) % 1_000_000);
+        assert_eq!(server.post(&bob, "/api/verify", json!({ "code": wrong })).await.status(), 400, "guess {i}");
+    }
+    let resp = server.post(&bob, "/api/verify", json!({ "code": format!("{code:06}") })).await;
+    assert_eq!(resp.status(), 400, "the right code after five wrong ones");
+
     // Players who have not confirmed their email are not listed.
-    assert_eq!(register("bob@example.com", "bob").await.status(), 204);
     let carol = server.register("carol").await;
     let players = server.get(&carol, "/api/players").await;
     assert_eq!(players.as_array().unwrap().iter().map(|p| p["username"].clone()).collect::<Vec<_>>(), [json!("alice2"), json!("carol")]);
@@ -196,9 +239,7 @@ async fn password_reset() {
 
     assert_eq!(server.post(&http, "/api/forgot", json!({ "email": "Alice@example.com" })).await.status(), 204);
     let token = server.link_token("alice@example.com", "/reset");
-    // A confirmation link is not a reset link, and a too short password leaves the token usable.
-    let verify = server.post(&http, "/api/verify", json!({ "token": token })).await;
-    assert_eq!(verify.status(), 400);
+    // A too short password leaves the token usable.
     let short = server.post(&http, "/api/reset", json!({ "token": token, "password": "short" })).await;
     assert_eq!(short.status(), 400);
     let resp = server.post(&http, "/api/reset", json!({ "token": token, "password": "newsecret" })).await;
@@ -217,7 +258,7 @@ async fn password_reset() {
 #[tokio::test]
 async fn email_rate_limit() {
     let server = start_server().await;
-    let http = reqwest::Client::new();
+    let http = browser();
     let forgot = |email: &str| server.post(&http, "/api/forgot", json!({ "email": email }));
     let register = |name: &str| {
         server.post(&http, "/api/register", json!({ "email": "bob@example.com", "username": name, "password": "secret1" }))
@@ -232,11 +273,11 @@ async fn email_rate_limit() {
     }
     assert_eq!(server.outbox.lock().unwrap().iter().filter(|m| m.subject.contains("Reset")).count(), 1);
 
-    // A refused registration leaves the earlier unconfirmed account and its link working.
+    // A refused registration leaves the earlier unconfirmed account and its code working.
     assert_eq!(register("bob").await.status(), 204);
-    let token = server.link_token("bob@example.com", "/verify");
+    let code = server.code("bob@example.com");
     assert_eq!(register("bobby").await.status(), 429);
-    let resp = server.post(&http, "/api/verify", json!({ "token": token })).await;
+    let resp = server.post(&http, "/api/verify", json!({ "code": code })).await;
     assert_eq!(resp.json::<Value>().await.unwrap()["username"], "bob");
 
     // Five emails per hour, counting only the last hour.

@@ -22,8 +22,8 @@ A multiplayer SET card game. The Rust server (`server/`: axum, sqlx with SQLite)
 
 ## Accounts
 
-- Registration is open and email based: `POST /api/register` creates an account with `email_verified_at` NULL and emails a `/verify?token=…` link (24 hours). `POST /api/verify` confirms it and logs in. Unconfirmed accounts cannot log in and are not listed or invitable.
-- Registering an email that is still unconfirmed replaces that account; unconfirmed accounts older than 24 hours are deleted on the next registration, freeing their username.
+- Registration is open and email based: `POST /api/register` creates an account with `email_verified_at` NULL and emails a 6-digit code (30 minutes). It also sets the HttpOnly `verify` cookie, the key of the code's row in `verifications`, so `POST /api/verify` with `{code}` confirms the email and logs in only in the browser that registered: an intercepted email is not enough. Each code allows 5 guesses. Unconfirmed accounts cannot log in and are not listed or invitable.
+- Registering an email that is still unconfirmed replaces that account; unconfirmed accounts older than 30 minutes are deleted on the next registration, freeing their username.
 - Login uses email and password. Usernames are only display names, unique case-insensitively.
 - `POST /api/forgot` always answers 204 so it does not reveal which emails exist, and emails a `/reset?token=…` link (1 hour). `POST /api/reset` sets the password, confirms the email, deletes all of the user's sessions, and logs in.
 - Email tokens live in `email_tokens`, are single use (deleted when used), and are checked against their `purpose`.
@@ -36,6 +36,6 @@ The project has no production data yet. Change the schema by editing `server/mig
 
 ## Tests
 
-- Integration tests start a real server on a random port with a fresh database file and `Mailer::Memory`, and read confirmation and reset links from the in-memory outbox (`Server::link_token`). `Server::register` registers and confirms a user in one step.
+- Integration tests start a real server on a random port with a fresh database file and `Mailer::Memory`, and read confirmation codes and reset links from the in-memory outbox (`Server::code`, `Server::link_token`). `Server::register` registers and confirms a user in one step.
 - Test behavior through the HTTP API and WebSocket messages, as the existing tests do.
 - UI changes have no automated tests: build the frontend, run the server, and check the pages in a browser.
