@@ -38,7 +38,8 @@ for arch in "${arches[@]}"; do
   stage=dist/$name
   rm -rf "$stage"
   mkdir -p "$stage/web"
-  cp "server/target/$target/release/set-server" "$stage/"
+  cargo_target_dir=$(cargo metadata --manifest-path server/Cargo.toml --no-deps --format-version 1 | jq -r '.target_directory')
+  cp "$cargo_target_dir/$target/release/set-server" "$stage/"
   cp -r web/dist "$stage/web/dist"
   cat > "$stage/README.txt" <<'EOF'
 SET game server
