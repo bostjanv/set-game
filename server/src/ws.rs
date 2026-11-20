@@ -19,18 +19,24 @@ async fn run(socket: WebSocket, user: CurrentUser, state: AppState) {
     let writer = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
             if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
+                return;
             }
         }
+        // The hub dropped this connection, because the account was deleted.
+        sink.send(Message::Close(None)).await.ok();
     });
-    let conn = state.hub.lock().unwrap().connect(user.id, tx.clone());
+    // Only the hub holds the sender, so the writer stops when the hub drops it.
+    let weak_tx = tx.downgrade();
+    let conn = state.hub.lock().unwrap().connect(user.id, tx);
 
     while let Some(Ok(frame)) = stream.next().await {
         let Message::Text(text) = frame else { continue };
         let msg = match serde_json::from_str::<ClientMsg>(&text) {
             Ok(msg) => msg,
             Err(e) => {
-                tx.send(json!({ "type": "error", "message": format!("Bad message: {e}") }).to_string()).ok();
+                if let Some(tx) = weak_tx.upgrade() {
+                    tx.send(json!({ "type": "error", "message": format!("Bad message: {e}") }).to_string()).ok();
+                }
                 continue;
             }
         };
@@ -44,12 +50,14 @@ async fn run(socket: WebSocket, user: CurrentUser, state: AppState) {
             _ => None,
         };
         let mut hub = state.hub.lock().unwrap();
+        if !hub.is_online(user.id) {
+            break; // the account was deleted
+        }
         if let Err(message) = hub.handle(user.id, &user.username, msg, invitee_name) {
             hub.send(user.id, &json!({ "type": "error", "message": message }));
         }
     }
 
     state.hub.lock().unwrap().disconnect(user.id, conn);
-    drop(tx);
     writer.abort();
 }

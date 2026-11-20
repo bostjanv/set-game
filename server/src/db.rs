@@ -55,14 +55,18 @@ pub async fn save_game(pool: &SqlitePool, started_at: i64, results: &[PlayerResu
         .execute(&mut *tx)
         .await?
         .last_insert_rowid();
+    // Players who deleted their account during the game have no row to refer to.
     for r in results {
-        sqlx::query("INSERT INTO game_players (game_id, user_id, sets, won) VALUES (?, ?, ?, ?)")
-            .bind(game_id)
-            .bind(r.user_id)
-            .bind(r.sets)
-            .bind(r.won)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO game_players (game_id, user_id, sets, won)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM users WHERE id = ?2)",
+        )
+        .bind(game_id)
+        .bind(r.user_id)
+        .bind(r.sets)
+        .bind(r.won)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(())

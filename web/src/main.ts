@@ -472,9 +472,30 @@ function profilePage() {
       h('h1', {}, state.me!.username),
       h('p', { class: 'hint' }, state.me!.email),
       h('p', {}, `Games played: ${state.me!.played} · Wins: ${state.me!.wins}`),
-      h('button', { class: 'secondary', onclick: () => logout() }, 'Log out'),
+      h(
+        'div',
+        { class: 'row' },
+        h('button', { class: 'secondary', onclick: () => logout() }, 'Log out'),
+        h('button', { class: 'danger', onclick: deleteAccount }, 'Delete account'),
+      ),
     ),
   ];
+}
+
+async function deleteAccount() {
+  const sure = confirm(
+    `Delete the account ${state.me!.username}? Your game history and statistics are removed and you leave any game you are in. This cannot be undone.`,
+  );
+  if (!sure) return;
+  try {
+    await api('DELETE', '/api/me');
+  } catch (err) {
+    toast(err instanceof Error ? err.message : String(err), 'error');
+    return;
+  }
+  endSession();
+  toast('Your account was deleted', 'success');
+  navigate('/');
 }
 
 // ---------- Game ----------

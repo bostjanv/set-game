@@ -492,6 +492,79 @@ async fn leader_leaving_cancels_waiting_game() {
     assert_eq!(b.until_type("notice").await["message"], "The leader closed the game");
 }
 
+#[tokio::test]
+async fn delete_account() {
+    let server = start_server().await;
+    let alice = server.register("alice").await;
+    let bob = server.register("bob").await;
+    let carol = server.register("carol").await;
+    let played = |a: i64, b: i64| [
+        set_server::db::PlayerResult { user_id: a, sets: 9, won: true },
+        set_server::db::PlayerResult { user_id: b, sets: 5, won: false },
+    ];
+    set_server::db::save_game(&server.db, 1, &played(alice.id, bob.id)).await.unwrap();
+    set_server::db::save_game(&server.db, 2, &played(bob.id, carol.id)).await.unwrap();
+
+    // Bob is in alice's waiting game; carol is invited to it.
+    let mut a = server.connect(&alice).await;
+    let mut b = server.connect(&bob).await;
+    let mut c = server.connect(&carol).await;
+    a.send(json!({ "type": "create_game" })).await;
+    let game_id = a.until_game(|g| g["status"] == "waiting").await["id"].clone();
+    a.send(json!({ "type": "invite", "user_id": bob.id })).await;
+    a.send(json!({ "type": "invite", "user_id": carol.id })).await;
+    b.until(|v| v["type"] == "invites" && !v["invites"].as_array().unwrap().is_empty()).await;
+    b.send(json!({ "type": "respond_invite", "game_id": game_id, "accept": true })).await;
+    a.until_game(|g| g["players"].as_array().unwrap().len() == 2).await;
+
+    // Deleting needs a session.
+    let anon = reqwest::Client::new().delete(format!("http://{}/api/me", server.base)).send().await.unwrap();
+    assert_eq!(anon.status(), 401);
+
+    let resp = bob.http.delete(format!("http://{}/api/me", server.base)).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(resp.headers().get_all("set-cookie").iter().any(|v| v.to_str().unwrap().starts_with("sid=;")), "clears the cookie");
+
+    // Bob's socket closes, and he leaves the game and the online list.
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(msg)) = b.ws.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    });
+    closed.await.expect("bob's socket closes");
+    a.until_game(|g| g["players"].as_array().unwrap().len() == 1).await;
+    a.until(|v| v["type"] == "online" && !v["user_ids"].as_array().unwrap().contains(&json!(bob.id))).await;
+
+    // His session, login, and listings are gone; the others keep their games, only his rows go.
+    let resp = bob.http.get(format!("http://{}/api/me", server.base)).header("cookie", &bob.cookie).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+    let login = server.post(&browser(), "/api/login", json!({ "email": "bob@example.com", "password": "secret1" })).await;
+    assert_eq!(login.status(), 401);
+    let players = server.get(&alice, "/api/players").await;
+    assert!(players.as_array().unwrap().iter().all(|p| p["username"] != "bob"));
+    assert_eq!(server.get(&alice, "/api/leaderboard").await, json!([
+        { "username": "alice", "played": 1, "wins": 1 },
+        { "username": "carol", "played": 1, "wins": 0 },
+    ]));
+
+    // The leader deleting their account cancels the game and withdraws carol's invitation.
+    c.until(|v| v["type"] == "invites" && !v["invites"].as_array().unwrap().is_empty()).await;
+    let resp = alice.http.delete(format!("http://{}/api/me", server.base)).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    c.until(|v| v["type"] == "invites" && v["invites"].as_array().unwrap().is_empty()).await;
+    assert_eq!(server.get(&carol, "/api/me").await["played"], 1);
+
+    // Games with no players left are removed.
+    let games: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM games").fetch_one(&server.db).await.unwrap();
+    assert_eq!(games, 1);
+
+    // The email and username are free again.
+    server.age_email_sends(3600).await;
+    server.register("bob").await;
+}
+
 /// A database written by the first release keeps working after every later migration. The seed
 /// below is written against 0001_init.sql, which never changes once deployed, so this test stays
 /// valid as migrations are added; extend the checks when a migration reshapes these tables.

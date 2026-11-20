@@ -8,6 +8,7 @@ A multiplayer SET card game. The Rust server (`server/`: axum, sqlx with SQLite)
 - Frontend type-check and build: `cd web && npm run build` (runs `tsc --noEmit`, then Vite into `web/dist`).
 - Run: build the frontend, then `cargo run --release --manifest-path server/Cargo.toml` from the repository root; it serves http://localhost:8080.
 - Frontend development: also run `npm run dev` in `web/` (Vite on :5173 proxies `/api` and `/ws` to :8080).
+- Test instance: the orb service `set-game` runs `./server/target/release/set-server` from the repository root on port 31263 with the default `set.db`, and is shared through a portal. It is for testing only: its database holds no data to keep, so reset or delete `set.db`, create test accounts, and restart it (`amp orb service restart set-game`) freely. Rebuild the frontend and the release binary first so it serves the current code.
 - CI (`.github/workflows/ci.yml`) runs `cargo test --locked`, `npm run build`, and `docker build`. Commit `server/Cargo.lock` with dependency changes.
 
 ## Layout
@@ -27,6 +28,7 @@ A multiplayer SET card game. The Rust server (`server/`: axum, sqlx with SQLite)
 - Registering an email that is still unconfirmed replaces that account; unconfirmed accounts without a working code are deleted on the next registration, freeing their username.
 - Login uses email and password. Usernames are only display names, unique case-insensitively.
 - `POST /api/forgot` always answers 204 and sets the `reset` cookie, so it does not reveal which emails exist; for an unknown email the cookie leads to no code. Asking again replaces the code. `POST /api/reset` with `{code, password}` sets the password, confirms the email, deletes all of the user's sessions, and logs in. Its errors never say how many guesses are left, which would reveal that the account exists.
+- `DELETE /api/me` deletes the account: its sessions and codes (by cascade), its `game_players` rows, and games left with no players. `Hub::remove_user` then takes it out of live games and invitations and drops its senders, which closes its WebSockets; `db::save_game` skips players whose account is gone.
 - Each address gets at most one email per minute and five per hour (`rate_limit_email`, table `email_sends`). Requests count even for unknown addresses, so a 429 from `/api/forgot` does not reveal whether an account exists. Tests that send two emails to one address within a minute call `Server::age_email_sends` in between.
 
 ## Database

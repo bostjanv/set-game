@@ -43,7 +43,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/forgot", post(forgot))
         .route("/api/reset", post(reset))
         .route("/api/logout", post(logout))
-        .route("/api/me", get(me))
+        .route("/api/me", get(me).delete(delete_me))
         .route("/api/players", get(players))
         .route("/api/leaderboard", get(leaderboard))
         .route("/ws", get(ws::handler))
@@ -388,6 +388,21 @@ async fn me(State(state): State<AppState>, user: CurrentUser) -> ApiResult<Json<
     .fetch_one(&state.db)
     .await?;
     Ok(Json(json!({ "id": user.id, "username": user.username, "email": email, "played": played, "wins": wins })))
+}
+
+/// Deletes the logged-in account with its sessions, codes, and game results; other players keep
+/// theirs. Then takes it out of live games and invitations and closes its connections. The
+/// database goes first, so the account cannot connect again in between.
+async fn delete_me(State(state): State<AppState>, user: CurrentUser) -> ApiResult<impl IntoResponse> {
+    let mut tx = state.db.begin().await?;
+    sqlx::query("DELETE FROM game_players WHERE user_id = ?").bind(user.id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM games WHERE NOT EXISTS (SELECT 1 FROM game_players gp WHERE gp.game_id = games.id)")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id = ?").bind(user.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    state.hub.lock().unwrap().remove_user(user.id);
+    Ok((AppendHeaders([(SET_COOKIE, auth::clear_cookie())]), StatusCode::NO_CONTENT))
 }
 
 async fn players(State(state): State<AppState>, _user: CurrentUser) -> ApiResult<Json<Value>> {

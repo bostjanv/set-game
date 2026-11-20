@@ -118,6 +118,23 @@ impl Hub {
         }
     }
 
+    /// Forgets a deleted account: it leaves its game like a player who walks away (a running game
+    /// keeps its score, but its result is not saved), its invitations are withdrawn, and its
+    /// connections close.
+    pub fn remove_user(&mut self, user: UserId) {
+        self.leave(user).ok();
+        let invited_to: Vec<GameId> =
+            self.games.iter().filter(|(_, g)| g.invited.iter().any(|(id, _)| *id == user)).map(|(&gid, _)| gid).collect();
+        for gid in invited_to {
+            self.games.get_mut(&gid).unwrap().invited.retain(|(id, _)| *id != user);
+            self.sync_game(gid);
+        }
+        // Dropping the senders ends each connection's writer, which closes the socket.
+        if self.conns.remove(&user).is_some() {
+            self.broadcast_online();
+        }
+    }
+
     pub fn is_online(&self, user: UserId) -> bool {
         self.conns.contains_key(&user)
     }
